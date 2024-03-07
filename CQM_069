@@ -1,0 +1,826 @@
+CREATE Procedure [dbo].[CQM_069]
+	@ProviderId BIGINT,
+	@PerformanceYear BIGINT,
+	@FromDate DATETIME = NULL,
+	@ToDate DATETIME = NULL,
+	@Practice_Code BIGINT,
+	@PopulationCriteria VARCHAR(500) = NULL,
+	@Report1 INT = 1
+AS
+BEGIN
+	SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+	SET NOCOUNT ON;
+
+	CREATE TABLE #GetAllResultSets (Patient_Account BIGINT, Patient_Name VARCHAR(500), Gender VARCHAR(15), DOB DATETIME, IPOP INT, DENOM INT, NUMER INT, DENEXCL INT, DENEXCEP INT)
+	CREATE TABLE #ValuesetBasedEncounters (Patient_Account BIGINT, Patient_Encounter_Id BIGINT, Patient_First_Name VARCHAR(150), Patient_Last_Name VARCHAR(150), Patient_Name VARCHAR(150)
+									, Practice_Code BIGINT, Provider_Code BIGINT, EthnicityID BIGINT, EthnicityDescription VARCHAR(150), RaceID BIGINT, RaceDescription VARCHAR(150)
+									, Gender VARCHAR(15), PayerID INT, Payer VARCHAR(255), BirthDate DATETIME, Age INT, FinancialClassID INT, FinancialClassDescription VARCHAR(255)
+									, InsCode VARCHAR(25), StartDate DATE, EndDate DATE, IPOP INT, DENOM INT, ValueSetOID VARCHAR(500), ValueSetName VARCHAR(MAX), VisitType VARCHAR(MAX));
+	CREATE TABLE #InitialPopulation (Patient_Account BIGINT, Patient_Encounter_Id BIGINT, Patient_First_Name VARCHAR(150), Patient_Last_Name VARCHAR(150), Patient_Name VARCHAR(150)
+									, Practice_Code BIGINT, Provider_Code BIGINT, EthnicityID BIGINT, EthnicityDescription VARCHAR(150), RaceID BIGINT, RaceDescription VARCHAR(150)
+									, Gender VARCHAR(15), PayerID INT, Payer VARCHAR(255), BirthDate DATETIME, Age INT, FinancialClassID INT, FinancialClassDescription VARCHAR(255)
+									, InsCode VARCHAR(25), StartDate DATE, EndDate DATE, IPOP INT, DENOM INT, ValueSetOID VARCHAR(500), ValueSetName VARCHAR(MAX));
+	CREATE TABLE #DenominatorExclusions (Patient_Account BIGINT, Patient_Name VARCHAR(150), Code VARCHAR(100), [Description] VARCHAR(MAX), StartDate DATETIME, EndDate DATETIME
+										, ValueSetName VARCHAR(MAX), Patient_Encounter_Id BIGINT);
+	CREATE TABLE #Numerator (Patient_Account BIGINT, Patient_Name VARCHAR(150), Code VARCHAR(100), [Description] VARCHAR(MAX), StartDate DATETIME, EndDate DATETIME, ValueSetName VARCHAR(MAX), Patient_Encounter_Id BIGINT);
+	CREATE TABLE #DenominatorExceptions (Patient_Account BIGINT, Patient_Name VARCHAR(150), Code VARCHAR(100), [Description] VARCHAR(MAX), StartDate DATETIME, EndDate DATETIME
+										, ValueSetName VARCHAR(MAX), Patient_Encounter_Id BIGINT);
+
+	IF @FromDate IS NULL OR @ToDate IS NULL
+	BEGIN
+		SET @FromDate = DATEFROMPARTS(@PerformanceYear, 1, 1);
+		SET @ToDate = DATEFROMPARTS(@PerformanceYear, 12, 31);
+	END
+
+	----------------------QUALIFYING ENCOUNTER VALUE SET CODING FOR MEASURE NO. 69 SECTION START
+
+	BEGIN
+		SELECT Code, Code_System, Value_Set_Name, Value_Set_OID 
+		INTO #valuseSetCoding
+		FROM CQM_Test..cqmcodinglist 
+		WHERE MeasureNum = '69' 
+			AND CMS_ID = 'CMS69v12'
+			AND Value_Set_Name IN ('Encounter Inpatient', 'Encounter to Evaluate BMI', 'Hospice Encounter', 'Palliative Care Encounter')
+	END
+
+	----------------------QUALIFYING ENCOUNTER VALUE SET CODING FOR MEASURE NO. 69 SECTION END
+
+
+	----------------------GET PATIENTS WITH INSURANCES SECTION START
+
+	BEGIN
+		SELECT DISTINCT p.Patient_Account, p.Patient_First_Name, p.Patient_Last_Name
+			, p.Patient_Last_Name + ', ' + p.Patient_First_Name + ' ' + ISNULL(MiddleName,'') AS Patient_Name, p.Practice_Code, p.Rendering_Physician_Id
+			, p.Gender, DATEDIFF(YEAR, p.Date_of_Birth, GETDATE()) Age, insp.Ins_Payer_Id, insp.Ins_Payer_Name, pati.Financial_Class_ID
+			, fcn.[Description] Financial_Class_Description, fcn.Code, p.Date_of_Birth Birth_Date
+		INTO #initialPats
+		FROM Medcare_DB_Dev..Patients p
+			INNER JOIN (SELECT * 
+					    FROM (SELECT ROW_NUMBER() OVER(PARTITION BY Patient_Account ORDER BY Patient_Insurance_ID)idx, *
+						 	  FROM Medcare_DB_Dev..Patient_Insurance
+						 	  WHERE Deleted = 0 AND Is_Active = 1
+						 	 ) x 
+					    WHERE idx = 1) pati ON p.Patient_Account = pati.Patient_Account AND pati.Deleted = 0
+			LEFT JOIN Medcare_DB_Dev..Insurance_addresses iaa ON pati.Ins_Address_Id = iaa.Ins_Address_Id AND iaa.Deleted = 0
+			LEFT JOIN Medcare_DB_Dev..Insurance_Payers insp ON iaa.Ins_Payer_Id = insp.Ins_Payer_Id AND insp.Deleted = 0
+			INNER JOIN (SELECT * FROM CQM_Test..cqmcodinglist WHERE Value_Set_Name = 'Payer' AND MeasureNum = '69') fcn ON fcn.Code = insp.typology
+		WHERE p.Deleted = 0 
+			AND p.Practice_Code = @Practice_Code
+			--AND p.Patient_Account IN (264502,264501,264506,264507,264509,264508,264493,264428,264471,264500,264495,264498)	
+	END
+
+	----------------------GET PATIENTS WITH INSURANCES SECTION END
+
+
+	----------------------PATIENT AGE >= 18 YEARS AT THE START OF THE MEASUREMENT PERIOD WITH A VISIT DURING MEASUREMENT PERIOD SECTION START
+
+	BEGIN
+		INSERT INTO #ValuesetBasedEncounters (Patient_Account, Patient_Encounter_Id, Patient_First_Name, Patient_Last_Name, Patient_Name, Practice_Code, Provider_Code, Gender
+												, Age, PayerID, Payer, FinancialClassID, FinancialClassDescription, InsCode, EthnicityID, EthnicityDescription, RaceID
+												, RaceDescription, BirthDate, StartDate, EndDate, IPOP, DENOM, ValueSetOID, ValueSetName, VisitType) 
+		SELECT pts.Patient_Account, pe.Patient_Encounter_Id, pts.Patient_First_Name, pts.Patient_Last_Name, pts.Patient_First_Name + ' ' + pts.Patient_Last_Name
+			, pts.Practice_Code, pe.Provider_Id Provider_Code, pts.Gender, pts.Age, pts.Ins_Payer_Id, pts.Ins_Payer_Name, pts.Financial_Class_ID
+			, pts.Financial_Class_Description, pts.Code, eth.Ethnicity_Id, eth.Ethnicity, rc.Race_Id, rc.Race, Birth_Date, pe.StartDate, pe.EndDate
+			, COUNT(pts.Patient_Account) OVER(PARTITION BY pts.Patient_Account ORDER BY pts.Patient_Account)
+			, COUNT(pe.Patient_Encounter_Id) OVER(PARTITION BY pts.Patient_Account ORDER BY pe.StartDate)
+			, vsc.Value_Set_OID, vsc.Value_Set_Name, pe.Visit_Type
+		FROM #initialPats pts
+			INNER JOIN Medcare_DB_Dev..[CQM_Encounters] pe ON pts.Patient_Account = pe.Patient_Account
+			INNER JOIN (SELECT Patient_Account,Race_Ethnicity_ID FROM Medcare_DB_Dev..Patient_Race_Ethnicity WHERE Type = 'race' AND Deleted = 0) rec ON pts.Patient_Account = rec.Patient_Account
+			INNER JOIN Medcare_DB_Dev..Race rc ON rec.Race_Ethnicity_ID = rc.Race_Id AND rc.Deleted = 0
+			INNER JOIN (SELECT Patient_Account,Race_Ethnicity_ID FROM Medcare_DB_Dev..Patient_Race_Ethnicity WHERE Type = 'ethnicity' AND Deleted = 0) ret ON pts.Patient_Account = ret.Patient_Account
+			INNER JOIN Medcare_DB_Dev..Ethnicity eth ON ret.Race_Ethnicity_ID = eth.Ethnicity_ID AND eth.Deleted = 0
+			INNER JOIN #valuseSetCoding vsc ON pe.Procedure_SNOMED_Code = vsc.Code
+		WHERE ROUND((DATEDIFF(dd, pts.Birth_Date, @FromDate)/365.23076923074), 0) >= 18 
+			AND CAST(pe.StartDate AS DATE) BETWEEN @FromDate AND @ToDate
+			AND pe.Provider_Id = @ProviderId
+			AND pe.Practice_Code = @Practice_Code
+			AND pe.[Status] = 'Signed'			
+	END
+
+	----------------------PATIENT AGE >= 18 YEARS AT THE START OF THE MEASUREMENT PERIOD WITH A VISIT DURING MEASUREMENT PERIOD SECTION END
+
+
+
+	----------------------INITIAL POPULATION WITH ENCOUNTER TO EVALUATE BMI VALUSET SECTION START
+
+	BEGIN
+		INSERT INTO #InitialPopulation (Patient_Account, Patient_Encounter_Id, Patient_First_Name, Patient_Last_Name, Patient_Name, Practice_Code, Provider_Code, Gender
+										, Age, PayerID, Payer, FinancialClassID, FinancialClassDescription, InsCode, EthnicityID, EthnicityDescription, RaceID
+										, RaceDescription, BirthDate, StartDate, EndDate, IPOP, DENOM, ValueSetOID, ValueSetName) 
+		SELECT Patient_Account, Patient_Encounter_Id, Patient_First_Name, Patient_Last_Name, Patient_Name, Practice_Code, Provider_Code, Gender, Age, PayerID, Payer
+			, FinancialClassID, FinancialClassDescription, InsCode, EthnicityID, EthnicityDescription, RaceID, RaceDescription, BirthDate, StartDate, EndDate, IPOP
+			, DENOM, ValueSetOID, ValueSetName
+		FROM #ValuesetBasedEncounters
+		WHERE ValueSetOID = '2.16.840.1.113883.3.600.1.1751'				--Encounter to Evaluate BMI
+			AND VisitType NOT IN ('Telemedicine Visit', 'Teleconsultation')
+	END
+
+	----------------------INITIAL POPULATION WITH ENCOUNTER TO EVALUATE BMI VALUSET SECTION END
+
+
+
+	----------------------MAKE A DATA SET SECTION START
+
+	BEGIN
+		INSERT INTO #GetAllResultSets (Patient_Account, Patient_Name, Gender, DOB, IPOP, DENOM, NUMER, DENEXCEP, DENEXCL)  
+		SELECT DISTINCT Patient_Account, Patient_First_Name + ' ' + Patient_Last_Name, Gender, BirthDate, 0, 0, 0, 0, 0 FROM #ValuesetBasedEncounters  
+
+		UPDATE ger
+		SET ger.IPOP = x.IPOP, ger.DENOM = x.DENOM
+		FROM #GetAllResultSets ger
+			INNER JOIN (SELECT DISTINCT Patient_Account, Patient_Name, COUNT(DISTINCT Patient_Account) IPOP, COUNT(DISTINCT Patient_Account) DENOM 
+						FROM #InitialPopulation
+						GROUP BY Patient_Account, Patient_Name) x ON ger.Patient_Account = x.Patient_Account
+	END
+
+	----------------------MAKE A DATA SET SECTION END
+
+
+
+	----------------------DENOMINATOR EXCLUSIONS WITH HOSPICE SERVICES/PALLIATIVE CARE IN MEASUREMENT PERIOD/PREGNANCY EXISTS SECTION START
+
+	BEGIN
+		----------------------HOSPICE SERVICES SECTION START
+
+		BEGIN
+			INSERT INTO #DenominatorExclusions (Patient_Account, Patient_Name, [Description], Code, StartDate, EndDate, ValueSetName, Patient_Encounter_Id)
+			-----Encounter, Performed: Encounter Inpatient With Discharge Disposition and Encounter relevant period ends during day of measurement period
+			SELECT pl.Patient_Account, pl.Patient_Name, icds.[Description], pe.Procedure_SNOMED_Code Code
+				, pl.StartDate, pl.EndDate, icds.Value_Set_Name, pl.Patient_Encounter_Id 
+			FROM #ValuesetBasedEncounters pl 
+				INNER JOIN Medcare_DB_Dev..[CQM_Encounters] pe ON pe.Patient_Account = pl.Patient_Account
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.666.5.307') icds ON icds.Code = pe.Procedure_SNOMED_Code		
+			WHERE pe.EndDate >= @FromDate AND pe.EndDate <= @ToDate 
+				AND pe.Discharged_To_Code IN ('428371000124100', '428361000124107')
+			UNION
+			-----Encounter, Performed: Hospice Encounter and Encounter relevant period overlaps during day of measurement period
+			SELECT pl.Patient_Account, pl.Patient_Name, icds.[Description], pe.Procedure_SNOMED_Code Code
+				, pl.StartDate, pl.EndDate, icds.Value_Set_Name, pl.Patient_Encounter_Id 
+			FROM #ValuesetBasedEncounters pl 
+				INNER JOIN Medcare_DB_Dev..[CQM_Encounters] pe ON pe.Patient_Account = pl.Patient_Account
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.464.1003.1003') icds ON icds.Code = pe.Procedure_SNOMED_Code		
+			WHERE pe.StartDate <= @ToDate AND pe.EndDate >= @FromDate
+			UNION
+			-----Intervention, Performed: Hospice Care Ambulatory and Intervention relevant datetime/period overlaps during day of measurement period
+			SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.Intervention_Code Code
+				, ipp.StartDate, ipp.EndDate, icds.Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM Medcare_DB_Dev..CQM_Interventions pl 
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.526.3.1584') icds ON icds.Code = pl.Intervention_Code
+				INNER JOIN #ValuesetBasedEncounters ipp ON pl.Patient_Account = ipp.Patient_Account
+			WHERE CAST(pl.StartDate AS DATE) BETWEEN @FromDate AND @ToDate 
+				AND ISNULL(pl.ActionPerformed, '') = 'Performed'
+			UNION
+			-----Intervention, Order: Hospice Care Ambulatory and Intervention created datetime during day of measurement period
+			SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.Intervention_Code Code
+				, ipp.StartDate, ipp.EndDate, icds.Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM Medcare_DB_Dev..CQM_Interventions pl 
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.526.3.1584') icds ON icds.Code = pl.Intervention_Code
+				INNER JOIN #ValuesetBasedEncounters ipp ON pl.Patient_Account = ipp.Patient_Account
+			WHERE CAST(pl.Created_Date AS DATE) BETWEEN CAST(@FromDate AS DATE) AND CAST(@ToDate AS DATE) 
+				AND ISNULL(pl.ActionPerformed, '') = 'Ordered'
+			UNION
+			-----Assessment, Performed: Hospice care [Minimum Data Set] With 'Yes' result value and Assessment relevant datetime/period overlaps during day of measurement period
+			SELECT pl.Patient_Account, ipp.Patient_Name, pl.Assessment [Description], pl.Assessment_Code Code, ipp.StartDate
+				, ipp.EndDate, '' Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM Medcare_DB_Dev..[CQM_AssessmentList] pl
+				INNER JOIN #ValuesetBasedEncounters ipp ON pl.Patient_Account = ipp.Patient_Account
+			WHERE CAST(pl.StartDate AS DATE) BETWEEN @FromDate AND @ToDate 
+				AND ISNULL(pl.[Status], '') = 'Performed' 
+				AND pl.Assessment_Code = '45755-6' 
+				AND pl.Result_Id = '373066001'
+			UNION
+			-----Diagnosis: Hospice Diagnosis and Diagnosis period overlaps during day of measurement period
+			SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.ICD Code, ipp.StartDate, ipp.EndDate
+				, icds.Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM Medcare_DB_Dev..CQM_Problemlist pl
+				INNER JOIN #ValuesetBasedEncounters ipp ON pl.Patient_Account = ipp.Patient_Account
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.464.1003.1165') icds ON icds.Code = pl.ICD
+			WHERE pl.StartDate <= @ToDate AND pl.EndDate >= @FromDate
+		END
+
+		----------------------HOSPICE SERVICES SECTION END
+
+
+
+		----------------------PALLIATIVE CARE IN MEASUREMENT PERIOD SECTION START
+
+		BEGIN
+			INSERT INTO #DenominatorExclusions (Patient_Account, Patient_Name, [Description], Code, StartDate, EndDate, ValueSetName, Patient_Encounter_Id)
+			-----Assessment, Performed: Functional Assessment of Chronic Illness Therapy - Palliative Care Questionnaire (FACIT-Pal) and Assessment relevant datetime/period overlaps during day of measurement period
+			SELECT pl.Patient_Account, ipp.Patient_Name, pl.Assessment [Description], pl.Assessment_Code Code, ipp.StartDate
+				, ipp.EndDate, '' Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM Medcare_DB_Dev..[CQM_AssessmentList] pl
+				INNER JOIN #ValuesetBasedEncounters ipp ON pl.Patient_Account = ipp.Patient_Account
+			WHERE pl.StartDate <= @ToDate AND pl.EndDate >= @FromDate 
+				AND ISNULL(pl.[Status], '') = 'Performed' 
+				AND pl.Assessment_Code = '71007-9'
+			UNION
+			-----Diagnosis: Palliative Care Diagnosis and Diagnosis period overlaps during day of measurement period
+			SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.ICD Code, ipp.StartDate, ipp.EndDate
+				, icds.Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM Medcare_DB_Dev..CQM_Problemlist pl
+				INNER JOIN #ValuesetBasedEncounters ipp ON pl.Patient_Account = ipp.Patient_Account
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.464.1003.1167') icds ON icds.Code = pl.ICD
+			WHERE pl.StartDate <= @ToDate AND pl.EndDate >= @FromDate
+			UNION
+			-----Encounter, Performed: Palliative Care Encounter and Encounter relevant period overlaps during day of measurement period
+			SELECT pl.Patient_Account, pl.Patient_Name, icds.[Description], pe.Procedure_SNOMED_Code Code
+				, pl.StartDate, pl.EndDate, icds.Value_Set_Name, pl.Patient_Encounter_Id 
+			FROM #ValuesetBasedEncounters pl 
+				INNER JOIN Medcare_DB_Dev..[CQM_Encounters] pe ON pe.Patient_Account = pl.Patient_Account
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.464.1003.101.12.1090') icds ON icds.Code = pe.Procedure_SNOMED_Code		
+			WHERE pe.StartDate <= @ToDate AND pe.EndDate >= @FromDate
+			UNION
+			-----Intervention, Performed: Palliative Care Intervention and Intervention relevant datetime/period overlaps during day of measurement period
+			SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.Intervention_Code Code
+				, ipp.StartDate, ipp.EndDate, icds.Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM Medcare_DB_Dev..CQM_Interventions pl 
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.464.1003.198.12.1135') icds ON icds.Code = pl.Intervention_Code
+				INNER JOIN #ValuesetBasedEncounters ipp ON pl.Patient_Account = ipp.Patient_Account
+			WHERE pl.StartDate <= @ToDate AND pl.EndDate >= @FromDate
+				AND ISNULL(pl.ActionPerformed, '') = 'Performed'
+		END
+
+		----------------------PALLIATIVE CARE IN MEASUREMENT PERIOD SECTION END
+
+
+
+		----------------------PREGNANCY EXISTS SECTION START
+
+		BEGIN
+			INSERT INTO #DenominatorExclusions (Patient_Account, Patient_Name, [Description], Code, StartDate, EndDate, ValueSetName, Patient_Encounter_Id)
+			-----Diagnosis: Pregnancy Obstetric or Maternal Diagnoses With Qualifying Encounter during day of measurement period and Diagnosis period overlaps during day of measurement period
+			SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.ICD Code, ipp.StartDate, ipp.EndDate
+				, icds.Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM Medcare_DB_Dev..CQM_Problemlist pl
+				INNER JOIN #InitialPopulation ipp ON pl.Patient_Account = ipp.Patient_Account
+				INNER JOIN Medcare_DB_Dev..[CQM_Encounters] pe ON pl.Patient_Account = pe.Patient_Account AND pe.Patient_Encounter_Id = ipp.Patient_Encounter_Id
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.600.1.1623') icds ON icds.Code = pl.ICD
+			WHERE pl.StartDate <= @ToDate AND pl.EndDate >= @FromDate			--Diagnosis period overlaps day of "Measurement Period"
+				AND ipp.StartDate <= @ToDate AND ipp.EndDate >= @FromDate		--Qualifying Encounter during Day of Measurement Period
+				AND pe.Visit_Type NOT IN ('Telemedicine Visit', 'Teleconsultation')
+				AND ipp.ValueSetOID = '2.16.840.1.113883.3.600.1.1751'				--Encounter to Evaluate BMI
+		END
+
+		----------------------PREGNANCY EXISTS SECTION END
+
+
+		UPDATE ger
+		SET ger.DENEXCL = x.DENEXCL
+		FROM #GetAllResultSets ger
+			INNER JOIN (SELECT DISTINCT Patient_Account, Patient_Name, COUNT(DISTINCT Patient_Account) DENEXCL 
+						FROM #DenominatorExclusions
+						GROUP BY Patient_Account, Patient_Name) x ON ger.Patient_Account = x.Patient_Account
+		WHERE ger.IPOP > 0
+	END
+
+	----------------------DENOMINATOR EXCLUSIONS WITH HOSPICE SERVICES/PALLIATIVE CARE IN MEASUREMENT PERIOD/PREGNANCY EXISTS SECTION END
+
+
+
+	----------------------NUMERATOR WITH HIGH BMI AND FOLLOW UP PROVIDED/LOW BMI AND FOLLOW UP PROVIDED/NORMAL BMI SECTION START
+
+	BEGIN
+		SELECT DISTINCT popa.Patient_Account,popa.Patient_Name 
+		INTO #NLessDc 
+		FROM #InitialPopulation popa
+		LEFT JOIN (SELECT Patient_Account FROM #DenominatorExclusions) de ON popa.Patient_Account = de.Patient_Account
+		WHERE de.Patient_Account IS NULL
+
+
+		SELECT ipp.Patient_Account,ipp.Patient_Name,'Occurrence A of Physical Exam, Finding: BMI LOINC Value (result >= 18.5 kg/m2)' Description,'39156-5' ICD	,'Physical Exam, Finding: BMI' ICDDescription
+		,'LOINC'title,'Clinical'DataType, pv.Vital_Date startdate,pv.Vital_Date EndDate,'2.16.840.1.113883.3.600.1.681' valueset,ipp.Patient_Encounter_Id  
+		INTO #a
+		FROM #NLessDc ab
+		JOIN #InitialPopulation ipp ON ab.Patient_Account = ipp.Patient_Account
+		JOIN Medcare_DB_Dev.[dbo].[CQM_Interventions] iq ON ipp.Patient_Account = iq.Patient_Account
+		JOIN Medcare_DB_Dev.dbo.Patient_Vitals pv ON ipp.Patient_Account = pv.Patient_Account
+		WHERE pv.BMI > 18.5
+		AND pv.Deleted = 0
+		AND pv.Vital_Date BETWEEN @FromDate AND @ToDate
+
+		SELECT ipp.Patient_Account,ipp.Patient_Name,'Occurrence A of Physical Exam, Finding: BMI LOINC Value (result < 25 kg/m2)' Description,'39156-5' ICD	,'Physical Exam, Finding: BMI' ICDDescription
+		      ,'LOINC'title,'Clinical'DataType,pv.Vital_Date startdate,pv.Vital_Date EndDate,'2.16.840.1.113883.3.600.1.681' valueset,ipp.Patient_Encounter_Id  
+		INTO #b
+		FROM #NLessDc ab
+		JOIN #InitialPopulation ipp ON ab.Patient_Account = ipp.Patient_Account
+		JOIN Medcare_DB_Dev.[dbo].[CQM_Interventions] iq ON ipp.Patient_Account = iq.Patient_Account
+		JOIN Medcare_DB_Dev.dbo.Patient_Vitals pv ON ipp.Patient_Account = pv.Patient_Account
+		WHERE pv.BMI < 25
+		AND pv.Deleted = 0
+		AND pv.Vital_Date BETWEEN @FromDate AND @ToDate
+
+		SELECT ipp.Patient_Account,ipp.Patient_Name,'Occurrence A of Physical Exam, Finding: BMI LOINC Value' Description,'39156-5' ICD	,'Physical Exam, Finding: BMI' ICDDescription,'LOINC'title
+			  ,'Clinical'DataType,MAX(pv.Vital_Date) StartDate,MAX(pv.Vital_Date) EndDate,'2.16.840.1.113883.3.600.1.681' valueset,MAX(ipp.Patient_Encounter_Id) Patient_Encounter_Id 
+		INTO #c
+		FROM #NLessDc ab
+		JOIN #InitialPopulation ipp ON ab.Patient_Account = ipp.Patient_Account
+		--JOIN Medcare_DB_Dev.[dbo].[CQM_Interventions] iq ON ipp.Patient_Account = iq.Patient_Account
+		JOIN Medcare_DB_Dev.dbo.Patient_Vitals pv ON ipp.Patient_Account = pv.Patient_Account
+		WHERE pv.Deleted = 0
+		And pv.Vital_Date >= @FromDate and pv.Vital_Date <= @ToDate
+		And (pv.BMI < 25 or pv.BMI < 18.5)
+		--AND pv.Vital_Date > DATEADD(MONTH,-12,ipp.EndDate) AND pv.Vital_Date <= ipp.EndDate
+		GROUP BY ipp.Patient_Account,ipp.Patient_Name
+
+		SELECT * INTO #NUM_A FROM #a
+		UNION ALL
+		SELECT * FROM #b
+		UNION ALL
+		SELECT * FROM #c
+	
+
+		SELECT pl.Patient_Account,icds.Description [Description],isnull(pl.Intervention_Code,'')  ICD,isnull(pl.Intervention_Description,'') + '|Overweight' ICDDescription,pl.Intervention_Code_System_Name title,pl.DataType,pl.StartDate,pl.EndDate
+		  ,icds.Value_Set_OID + '|2.16.840.1.113883.3.600.2387'   valueset
+	into  #NUMB1
+	from Medcare_DB_Dev..[CQM_Interventions] pl 
+	inner join (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113762.1.4.1047.502') icds on icds.Code=pl.Intervention_Code 
+	and isnull(pl.ActionPerformed,'') = '' -- Overweight snomed code 238131007
+	inner join #NLessDc b on b.Patient_Account = pl.Patient_Account
+	WHERE cast(pl.startDate as date) between DATEADD(MONTH,-6,(pl.EndDate)) and pl.EndDate
+	
+		
+
+	SELECT Patient_Account,'Occurrence A of Physical Exam, Finding: BMI LOINC Value (result >= 25 kg/m2)' Description
+	,'39156-5' ICD	,'Physical Exam, Finding: BMI' ICDDescription,'LOINC'title,'Clinical'DataType,Vital_Date StartDate,Vital_Date EndDate,'2.16.840.1.113883.3.600.1.681' valueset
+	INTO #NUMB2
+	FROM Medcare_DB_Dev..Patient_Vitals
+	where bmi >= 25
+	and Deleted = 0
+
+	select b1.* 
+	INTO #NUMB_B
+	from #NUMB1 b1
+	inner join #NUMB2 b2 on b1.Patient_Account = b2.Patient_Account
+
+
+	SELECT pl.Patient_Account,icds.Description [Description],pl.Intervention_Code CPTCode,pl.Intervention_Description ICDDescription,pl.Intervention_Code_System_Name title,pl.DataType,pl.StartDate,pl.EndDate
+		  ,icds.Value_Set_OID valueset
+into  #NUMC1
+	from Medcare_DB_Dev..[CQM_Interventions] pl 
+	inner join (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.526.3.1563') icds on icds.Code=pl.Intervention_Code
+	--pl.result = '248342006' 
+	and isnull(pl.ActionPerformed,'') = ''--(under weight)
+	inner join #NLessDc b on b.Patient_Account = pl.Patient_Account
+	WHERE pl.startDate between DATEADD(MONTH,-6,(pl.EndDate)) and pl.EndDate
+
+	SELECT Patient_Account,'Occurrence A of Physical Exam, Finding: BMI LOINC Value (result < 18.5 kg/m2)' Description
+	,'39156-5' ICD	,'Physical Exam, Finding: BMI' ICDDescription,'Lonic'title,'Clinical'DataType,Vital_Date StartDate,Vital_Date EndDate
+	,'2.16.840.1.113883.3.600.1.681' valueset
+INTO #NUMC2
+	FROM Medcare_DB_Dev..Patient_Vitals
+	where bmi >= 25
+	and Deleted = 0
+
+	select c1.* 
+INTO #NUM_C
+	from #NUMC1 c1
+	inner join #NUMC2 c2 on c1.Patient_Account = c2.Patient_Account
+
+	 
+	select t1.Patient_Account 
+INTO #NUMERATORDATA	
+	from (
+	select Patient_Account from #NUM_A
+	union all
+	select Patient_Account from #NUMB_B
+	union all
+	select Patient_Account from #NUM_C
+	)t1 
+	inner join (select a.Patient_Account from #InitialPopulation a 
+				left join (select Patient_Account from #DenominatorExclusions) b on a.Patient_Account = b.Patient_Account  where b.Patient_Account is null ) p 
+	on t1.Patient_Account = p.Patient_Account
+
+		--new
+		UPDATE ger
+		SET ger.NUMER = x.NUMER
+		FROM #GetAllResultSets ger
+			JOIN (SELECT DISTINCT Patient_Account,  COUNT(DISTINCT Patient_Account) NUMER 
+				  FROM #NUMERATORDATA
+				  GROUP BY Patient_Account) x ON ger.Patient_Account = x.Patient_Account
+		WHERE ger.IPOP > 0
+
+	--"Medication, Ordered: Medications for Above Normal BMI" using "Medications for Above Normal BMI (2.16.840.1.113883.3.526.3.1561)"
+	SELECT pl.Patient_Account,icds.Description [Description],pl.Medication_Code CPTCode,icds.Description ICDDescription,'' title,'' DataType,pl.Effective_Date StartDate,pl.Effective_End_Date EndDate
+		  ,icds.Value_Set_OID valueset
+	into #aas
+	from Medcare_DB_Dev..CQM_Medication_Order pl
+	inner join (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.526.3.1561') icds on icds.Code=pl.Medication_Code
+	and isnull(pl.Medication_Type,'') IN ('Current', 'Past')
+	inner join #NLessDc b on b.Patient_Account = pl.Patient_Account
+	inner join Medcare_DB_Dev..CQM_Vitals_BMI cv ON pl.Patient_Account = cv.Patient_Account
+	WHERE Vital_Date between @FromDate and @ToDate
+	and cv.BMI > 30
+	UNION ALL
+	SELECT pl.Patient_Account,icds.Description [Description],pl.Intervention_Code CPTCode,icds.Description ICDDescription,'' title,'' DataType,pl.StartDate,pl.EndDate
+		  ,icds.Value_Set_OID valueset
+	from Medcare_DB_Dev..CQM_Interventions pl
+	inner join (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.600.1.1525') icds on icds.Code=pl.Intervention_Code
+	and isnull(pl.ActionPerformed,'') IN ('Not Ordered')
+	inner join #NLessDc b on b.Patient_Account = pl.Patient_Account
+	inner join Medcare_DB_Dev..CQM_Vitals_BMI cv ON pl.Patient_Account = cv.Patient_Account
+	WHERE Vital_Date between @FromDate and @ToDate
+	and cv.BMI > 30
+	UNION ALL
+	SELECT pl.Patient_Account,icds.Description [Description],pl.Intervention_Code CPTCode,icds.Description ICDDescription,'' title,'' DataType,pl.StartDate,pl.EndDate
+		  ,icds.Value_Set_OID valueset
+	from Medcare_DB_Dev..CQM_Interventions pl
+	inner join (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.600.1.1525') icds on icds.Code=pl.Intervention_Code
+	and isnull(pl.ActionPerformed,'') IN ('Not Performed')
+	inner join #NLessDc b on b.Patient_Account = pl.Patient_Account
+	inner join Medcare_DB_Dev..CQM_Vitals_BMI cv ON pl.Patient_Account = cv.Patient_Account
+	WHERE Vital_Date between @FromDate and @ToDate
+	and cv.BMI > 30
+	
+		----------------------LOW BMI AND FOLLOW UP PROVIDED SECTION START
+	--"Medication, Ordered: Medications for Below Normal BMI" using "Medications for Below Normal BMI (2.16.840.1.113883.3.526.3.1562)"
+	SELECT pl.Patient_Account,icds.Description [Description],pl.Medication_Code CPTCode,icds.Description ICDDescription,'' title,'' DataType,pl.Effective_Date StartDate,pl.Effective_End_Date EndDate
+		  ,icds.Value_Set_OID valueset
+	into #bbs
+	from Medcare_DB_Dev..CQM_Medication_Order pl
+	inner join (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.526.3.1562') icds on icds.Code=pl.Medication_Code
+	--pl.result = '248342006'
+	and isnull(pl.Medication_Type,'') IN ('Current', 'Past')
+	inner join #NLessDc b on b.Patient_Account = pl.Patient_Account
+	inner join Medcare_DB_Dev..CQM_Vitals_BMI cv ON pl.Patient_Account = cv.Patient_Account
+	WHERE Vital_Date between @FromDate and @ToDate
+	and cv.BMI < 18
+	UNION ALL
+	SELECT pl.Patient_Account,icds.Description [Description],pl.Intervention_Code CPTCode,icds.Description ICDDescription,'' title,'' DataType,pl.StartDate,pl.EndDate
+		  ,icds.Value_Set_OID valueset
+	from Medcare_DB_Dev..CQM_Interventions pl
+	inner join (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.600.1.1528') icds on icds.Code=pl.Intervention_Code
+	and isnull(pl.ActionPerformed,'') IN ('Ordered')
+	inner join #NLessDc b on b.Patient_Account = pl.Patient_Account
+	inner join Medcare_DB_Dev..CQM_Vitals_BMI cv ON pl.Patient_Account = cv.Patient_Account
+	WHERE Vital_Date between @FromDate and @ToDate
+	and cv.BMI < 18
+	UNION ALL
+	SELECT pl.Patient_Account,icds.Description [Description],pl.Intervention_Code CPTCode,icds.Description ICDDescription,'' title,'' DataType,pl.StartDate,pl.EndDate
+		  ,icds.Value_Set_OID valueset
+	from Medcare_DB_Dev..CQM_Interventions pl
+	inner join (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.600.1.1528') icds on icds.Code=pl.Intervention_Code
+	and isnull(pl.ActionPerformed,'') IN ('Performed')
+	inner join #NLessDc b on b.Patient_Account = pl.Patient_Account
+	inner join Medcare_DB_Dev..CQM_Vitals_BMI cv ON pl.Patient_Account = cv.Patient_Account
+	WHERE Vital_Date between @FromDate and @ToDate
+	and cv.BMI < 18
+		----------------------LOW BMI AND FOLLOW UP PROVIDED SECTION END
+
+		----------------------HAS NORMAL BMI SECTION START
+		SELECT Patient_Account,'Occurrence A of Physical Exam, Finding: BMI LOINC Value (result < 18.5 kg/m2)' Description
+	,'39156-5' ICD	,'Physical Exam, Finding: BMI' ICDDescription,'Lonic'title,'Clinical'DataType,Vital_Date StartDate,Vital_Date EndDate
+	,'2.16.840.1.113883.3.600.1.681' valueset
+	INTO #NUMCX
+	FROM Medcare_DB_Dev..Patient_Vitals
+	where bmi >= 18 and bmi <=25
+	and Deleted = 0
+	----------------------HAS NORMAL BMI SECTION END
+
+	select Patient_Account
+	into #NUMERATORDATAA
+	from #aas
+	union
+	select Patient_Account from #bbs
+	union 
+	select Patient_Account from #NUMCX
+
+	UPDATE ger
+		SET ger.NUMER = x.NUMER
+		FROM #GetAllResultSets ger
+			JOIN (SELECT DISTINCT Patient_Account,  COUNT(DISTINCT Patient_Account) NUMER 
+				  FROM #NUMERATORDATAA
+				  GROUP BY Patient_Account) x ON ger.Patient_Account = x.Patient_Account
+	WHERE ger.IPOP > 0
+
+	END
+
+	----------------------NUMERATOR WITH HIGH BMI AND FOLLOW UP PROVIDED/LOW BMI AND FOLLOW UP PROVIDED/NORMAL BMI SECTION END
+	
+
+
+	----------------------DENOMINATOR EXCEPTIONS EXISTS (MEDICAL REASON FOR NOT DOCUMENTING A FOLLOW UP PLAN FOR LOW/HIGH BMI) OR (MEDICAL REASON OR PATIENT REASON FOR NOT PERFORMING BMI EXAM) SECTION START
+
+	BEGIN
+		SELECT DISTINCT popa.Patient_Account, popa.Patient_Name 
+		INTO #NotMet_DenominatorExclusion_Numerator
+		FROM #InitialPopulation popa
+			LEFT JOIN (SELECT Patient_Account FROM #DenominatorExclusions) de ON popa.Patient_Account = de.Patient_Account
+			LEFT JOIN (SELECT Patient_Account FROM #Numerator) num ON popa.Patient_Account = num.Patient_Account
+		WHERE num.Patient_Account IS NULL AND de.Patient_Account IS NULL
+
+		
+		----------------------MEDICAL REASON FOR NOT DOCUMENTING A FOLLOW UP PLAN FOR LOW/HIGH BMI SECTION START
+
+		BEGIN
+			INSERT INTO #DenominatorExceptions (Patient_Account, Patient_Name, [Description], Code, StartDate, EndDate, ValueSetName, Patient_Encounter_Id)
+			-----Intervention: Not Ordered with Qualifying Encounter during day of measurement period and author datetime same day as start of Qualifying Encounter releavnt period
+			----- and negation reason fall in Medical Reason valueset
+			-----Valuesets for Interventions: Referrals Where Weight Assessment May Occur (2.16.840.1.113883.3.600.1.1527)
+			SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.Intervention_Code Code
+				, ipp.StartDate, ipp.EndDate, icds.Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM #NotMet_DenominatorExclusion_Numerator de
+				INNER JOIN Medcare_DB_Dev..CQM_Interventions pl ON pl.Patient_Account = de.Patient_Account
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.600.1.1527') icds ON icds.Code = pl.Intervention_Code
+				INNER JOIN #InitialPopulation ipp ON pl.Patient_Account = ipp.Patient_Account
+				INNER JOIN (SELECT * FROM CQM_Test..cqmcodinglist WHERE Value_Set_OID = '2.16.840.1.113883.3.526.3.1007' AND MeasureNum = '69' AND CMS_ID = 'CMS69v12') rea ON rea.Code = pl.Reason_Code
+			WHERE CAST(pl.Created_Date AS DATE) = ipp.StartDate 
+				AND ISNULL(pl.ActionPerformed, '') = 'Not Ordered'
+			UNION
+			-----Intervention: Not Ordered with Qualifying Encounter during day of measurement period and author datetime same day as start of Qualifying Encounter releavnt period
+			----- and negation reason fall in Medical Reason valueset
+			-----Valuesets for Interventions: Follow Up for Above Normal BMI (2.16.840.1.113883.3.600.1.1525)
+			SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.Intervention_Code Code
+				, ipp.StartDate, ipp.EndDate, icds.Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM #NotMet_DenominatorExclusion_Numerator de
+				INNER JOIN Medcare_DB_Dev..CQM_Interventions pl ON pl.Patient_Account = de.Patient_Account
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.600.1.1525') icds ON icds.Code = pl.Intervention_Code
+				INNER JOIN #InitialPopulation ipp ON pl.Patient_Account = ipp.Patient_Account
+				INNER JOIN (SELECT * FROM CQM_Test..cqmcodinglist WHERE Value_Set_OID = '2.16.840.1.113883.3.526.3.1007' AND MeasureNum = '69' AND CMS_ID = 'CMS69v12') rea ON rea.Code = pl.Reason_Code
+			WHERE CAST(pl.Created_Date AS DATE) = ipp.StartDate 
+				AND ISNULL(pl.ActionPerformed, '') = 'Not Ordered'
+			UNION
+			-----Intervention: Not Ordered with Qualifying Encounter during day of measurement period and author datetime same day as start of Qualifying Encounter releavnt period
+			----- and negation reason fall in Medical Reason valueset
+			-----Valuesets for Interventions: Follow Up for Below Normal BMI (2.16.840.1.113883.3.600.1.1528)
+			SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.Intervention_Code Code
+				, ipp.StartDate, ipp.EndDate, icds.Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM #NotMet_DenominatorExclusion_Numerator de
+				INNER JOIN Medcare_DB_Dev..CQM_Interventions pl ON pl.Patient_Account = de.Patient_Account
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.600.1.1528') icds ON icds.Code = pl.Intervention_Code
+				INNER JOIN #InitialPopulation ipp ON pl.Patient_Account = ipp.Patient_Account
+				INNER JOIN (SELECT * FROM CQM_Test..cqmcodinglist WHERE Value_Set_OID = '2.16.840.1.113883.3.526.3.1007' AND MeasureNum = '69' AND CMS_ID = 'CMS69v12') rea ON rea.Code = pl.Reason_Code
+			WHERE CAST(pl.Created_Date AS DATE) = ipp.StartDate 
+				AND ISNULL(pl.ActionPerformed, '') = 'Not Ordered'
+			UNION
+			-----Intervention: Not Performed with Qualifying Encounter during day of measurement period and author datetime same day as start of Qualifying Encounter releavnt period
+			----- and negation reason fall in Medical Reason valueset
+			-----Valuesets for Interventions: Follow Up for Above Normal BMI (2.16.840.1.113883.3.600.1.1525)
+			SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.Intervention_Code Code
+				, ipp.StartDate, ipp.EndDate, icds.Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM #NotMet_DenominatorExclusion_Numerator de
+				INNER JOIN Medcare_DB_Dev..CQM_Interventions pl ON pl.Patient_Account = de.Patient_Account
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.600.1.1525') icds ON icds.Code = pl.Intervention_Code
+				INNER JOIN #InitialPopulation ipp ON pl.Patient_Account = ipp.Patient_Account
+				INNER JOIN (SELECT * FROM CQM_Test..cqmcodinglist WHERE Value_Set_OID = '2.16.840.1.113883.3.526.3.1007' AND MeasureNum = '69' AND CMS_ID = 'CMS69v12') rea ON rea.Code = pl.Reason_Code
+			WHERE CAST(pl.Created_Date AS DATE) = ipp.StartDate 
+				AND ISNULL(pl.ActionPerformed, '') = 'Not Performed'
+			UNION
+			-----Intervention: Not Performed with Qualifying Encounter during day of measurement period and author datetime same day as start of Qualifying Encounter releavnt period
+			----- and negation reason fall in Medical Reason valueset
+			-----Valuesets for Interventions: Follow Up for Below Normal BMI (2.16.840.1.113883.3.600.1.1528)
+			SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.Intervention_Code Code
+				, ipp.StartDate, ipp.EndDate, icds.Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM #NotMet_DenominatorExclusion_Numerator de
+				INNER JOIN Medcare_DB_Dev..CQM_Interventions pl ON pl.Patient_Account = de.Patient_Account
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.600.1.1528') icds ON icds.Code = pl.Intervention_Code
+				INNER JOIN #InitialPopulation ipp ON pl.Patient_Account = ipp.Patient_Account
+				INNER JOIN (SELECT * FROM CQM_Test..cqmcodinglist WHERE Value_Set_OID = '2.16.840.1.113883.3.526.3.1007' AND MeasureNum = '69' AND CMS_ID = 'CMS69v12') rea ON rea.Code = pl.Reason_Code
+			WHERE CAST(pl.Created_Date AS DATE) = ipp.StartDate 
+				AND ISNULL(pl.ActionPerformed, '') = 'Not Performed'
+			UNION
+			-----Medication: Not Ordered with Qualifying Encounter during day of measurement period and author datetime same day as start of Qualifying Encounter releavnt period
+			----- and negation reason fall in Medical Reason valueset
+			-----Valuesets for Medications: Medications for Above Normal BMI (2.16.840.1.113883.3.526.3.1561)
+			SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.Medication_Code Code
+				, ipp.StartDate, ipp.EndDate, icds.Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM #NotMet_DenominatorExclusion_Numerator de
+				INNER JOIN Medcare_DB_Dev..CQM_Medication_Order pl ON pl.Patient_Account = de.Patient_Account
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.526.3.1561') icds ON icds.Code = pl.Medication_Code
+				INNER JOIN #InitialPopulation ipp ON pl.Patient_Account = ipp.Patient_Account
+				INNER JOIN (SELECT * FROM CQM_Test..cqmcodinglist WHERE Value_Set_OID = '2.16.840.1.113883.3.526.3.1007' AND MeasureNum = '69' AND CMS_ID = 'CMS69v12') rea ON rea.Code = pl.Reason_Code
+			WHERE CAST(pl.Created_Date AS DATE) = ipp.StartDate 
+				AND pl.Medication_Type = 'Refused'
+			UNION
+			-----Medication: Not Ordered with Qualifying Encounter during day of measurement period and author datetime same day as start of Qualifying Encounter releavnt period
+			----- and negation reason fall in Medical Reason valueset
+			-----Valuesets for Medications: Medications for Below Normal BMI (2.16.840.1.113883.3.526.3.1562)
+			SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.Medication_Code Code
+				, ipp.StartDate, ipp.EndDate, icds.Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM #NotMet_DenominatorExclusion_Numerator de
+				INNER JOIN Medcare_DB_Dev..CQM_Medication_Order pl ON pl.Patient_Account = de.Patient_Account
+				INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '69' AND CMS_ID = 'CMS69v12' AND Value_Set_OID = '2.16.840.1.113883.3.526.3.1562') icds ON icds.Code = pl.Medication_Code
+				INNER JOIN #InitialPopulation ipp ON pl.Patient_Account = ipp.Patient_Account
+				INNER JOIN (SELECT * FROM CQM_Test..cqmcodinglist WHERE Value_Set_OID = '2.16.840.1.113883.3.526.3.1007' AND MeasureNum = '69' AND CMS_ID = 'CMS69v12') rea ON rea.Code = pl.Reason_Code
+			WHERE CAST(pl.Created_Date AS DATE) = ipp.StartDate 
+				AND pl.Medication_Type = 'Refused'
+		END
+
+		----------------------MEDICAL REASON FOR NOT DOCUMENTING A FOLLOW UP PLAN FOR LOW/HIGH BMI SECTION END
+
+
+
+		----------------------MEDICAL REASON OR PATIENT REASON FOR NOT PERFORMING BMI EXAM SECTION START
+
+		BEGIN
+			INSERT INTO #DenominatorExceptions (Patient_Account, Patient_Name, [Description], Code, StartDate, EndDate, ValueSetName, Patient_Encounter_Id)
+			-----Physical Exam: Not Performed with Qualifying Encounter during day of measurement period and author/relevant period datetime ends same day as start of Qualifying Encounter releavnt period
+			----- and negation reason fall in Medical Reason (2.16.840.1.113883.3.526.3.1007) or Patient Declined (2.16.840.1.113883.3.526.3.1582) valueset
+			-----LOINC Code: Body mass index (BMI) [Ratio] => (39156-5)
+			SELECT pl.Patient_Account, ipp.Patient_Name, '' [Description], pl.BMI_Code Code
+				, ipp.StartDate, ipp.EndDate, '' Value_Set_Name, ipp.Patient_Encounter_Id
+			FROM #NotMet_DenominatorExclusion_Numerator de
+				INNER JOIN Medcare_DB_Dev..CQM_Vitals_BMI pl ON pl.Patient_Account = de.Patient_Account
+				INNER JOIN #InitialPopulation ipp ON pl.Patient_Account = ipp.Patient_Account
+				INNER JOIN (SELECT * FROM CQM_Test..cqmcodinglist WHERE Value_Set_OID IN ('2.16.840.1.113883.3.526.3.1007', '2.16.840.1.113883.3.526.3.1582') AND MeasureNum = '69' AND CMS_ID = 'CMS69v12') rea ON rea.Code = pl.Reason_Code
+			WHERE CAST(pl.Created_Date AS DATE) = ipp.StartDate 
+				AND pl.BMI_Refused = 1
+		END
+
+		----------------------MEDICAL REASON OR PATIENT REASON FOR NOT PERFORMING BMI EXAM SECTION END
+
+		UPDATE ger
+		SET ger.DENEXCEP = x.DENEXCEP
+		FROM #GetAllResultSets ger
+			JOIN (SELECT DISTINCT Patient_Account, Patient_Name, COUNT(DISTINCT Patient_Account) DENEXCEP 
+				  FROM #DenominatorExceptions
+				  GROUP BY Patient_Account, Patient_Name) x ON ger.Patient_Account = x.Patient_Account
+		WHERE ger.IPOP > 0
+	END
+
+	----------------------DENOMINATOR EXCEPTIONS EXISTS (MEDICAL REASON FOR NOT DOCUMENTING A FOLLOW UP PLAN FOR LOW/HIGH BMI) OR (MEDICAL REASON OR PATIENT REASON FOR NOT PERFORMING BMI EXAM) SECTION END
+
+	
+
+	----------------------FINAL RESULT SET SECTION START
+
+	BEGIN
+		SELECT CAST(Patient_Account AS VARCHAR) Patient_Account, Patient_Name, Gender, DOB, SUM(IPOP) IPOP, SUM(DENOM) DENOM, SUM(NUMER) NUMER, SUM(DENEXCL) DENEXCL, SUM(DENEXCEP) DENEXCEP
+		INTO #getResult 
+		FROM #GetAllResultSets
+		GROUP BY ROLLUP(CAST(Patient_Account AS VARCHAR), Patient_Name, Gender, DOB)
+
+		-- This IS when we GROUP BY ROLLUP we get extra NULL columns AND grouping of columns so used the machanissm to overcome result
+		SELECT * 
+		INTO #fnlResult
+		FROM #getResult
+		WHERE Patient_Account IS NOT NULL AND Patient_Name IS NOT NULL AND Gender IS NOT NULL AND DOB IS NOT NULL
+		UNION ALL
+		SELECT * FROM #getResult WHERE Patient_Account IS NULL AND Patient_Name IS NULL 
+
+		IF EXISTS (SELECT 1 FROM #fnlResult WHERE Patient_Account IS NULL AND Patient_Name IS NULL)
+		BEGIN
+			UPDATE #fnlResult
+			SET Patient_Account = 'Total'
+			WHERE Patient_Account IS NULL AND Patient_Name IS NULL
+		END
+	END
+
+	----------------------FINAL RESULT SET SECTION END
+	
+
+
+	----------------------RETURN RESULT SET ACCORDING @Report1 PARAM VALUE SECTION START
+
+	IF @Report1 = 1
+		BEGIN	--RETURNS DATA ON THE BASIS OF POPULATION CRITERIA
+			IF @PopulationCriteria = 'Initial Population'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, IPOP, 0 DENOM, 0 NUMER, 0 DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Denominator'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, DENOM, 0 NUMER, 0 DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE DENOM > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Numerator'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, NUMER, 0 DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE NUMER > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Exclusion'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, 0 NUMER, DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE DENEXCL > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Exception'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, 0 NUMER, 0 DENEXCL, DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE DENEXCEP > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'NOT Met'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, 0 NUMER, 0 DENEXCL, 0 DENEXCEP, (IPOP - NUMER - DENEXCL - DENEXCEP) NOT_MET
+					FROM #fnlResult
+					WHERE (IPOP - NUMER - DENEXCL - DENEXCEP) > 0
+					ORDER BY Patient_Name
+				END
+			ELSE
+				BEGIN
+					SELECT fr.*, [NOT_MET] = (IPOP - NUMER - DENEXCL - DENEXCEP) -- A - B - 0 - 0 = X,A - 0 - 0 - 0 = A 
+					FROM #fnlResult fr
+					ORDER BY Patient_Name
+				END		
+		END
+	ELSE
+		BEGIN	--COUNTS FOR TABS ON POPUP OR DASHBOARD
+			SELECT 'CMS69v12' AS MeasureId,  (SELECT COUNT(Patient_Account) FROM #GetAllResultSets) AS AllPatientsCount, IPOP InitialPopulationCount
+				, DENOM AS DenominatorCount, NUMER AS NumeratorCount, DENEXCL AS ExclusionCount, DENEXCEP AS ExceptionCount
+				, NotMetCount = (IPOP - NUMER - DENEXCL - DENEXCEP), 0 TotalEncountersCount, 0 EncountersCount
+			FROM #fnlResult
+			WHERE Patient_Account = 'Total'
+		END
+
+	----------------------RETURN RESULT SET ACCORDING @Report1 PARAM VALUE SECTION END
+
+
+
+	----------------------DROP ALL TEMP TABLES SECTION START
+
+	BEGIN
+		IF (OBJECT_ID('tempdb..#GetAllResultSets') IS NOT NULL)
+			DROP TABLE #GetAllResultSets			
+
+		IF (OBJECT_ID('tempdb..#ValuesetBasedEncounters') IS NOT NULL)
+			DROP TABLE #ValuesetBasedEncounters
+
+		IF (OBJECT_ID('tempdb..#InitialPopulation') IS NOT NULL) 
+			DROP TABLE #InitialPopulation
+
+		IF (OBJECT_ID('tempdb..#DenominatorExclusions') IS NOT NULL) 
+			DROP TABLE #DenominatorExclusions
+	
+		IF (OBJECT_ID('tempdb..#Numerator') IS NOT NULL) 
+			DROP TABLE #Numerator
+
+		IF (OBJECT_ID('tempdb..#DenominatorExceptions') IS NOT NULL)
+			DROP TABLE #DenominatorExceptions
+
+		IF (OBJECT_ID('tempdb..#valuseSetCoding') IS NOT NULL)
+			DROP TABLE #valuseSetCoding
+
+		IF (OBJECT_ID('tempdb..#initialPats') IS NOT NULL)
+			DROP TABLE #initialPats
+
+		IF (OBJECT_ID('tempdb..#NLessDc') IS NOT NULL)
+			DROP TABLE #NLessDc
+
+		IF (OBJECT_ID('tempdb..#a') IS NOT NULL)
+			DROP TABLE #a
+
+		IF (OBJECT_ID('tempdb..#b') IS NOT NULL)
+			DROP TABLE #b
+
+		IF (OBJECT_ID('tempdb..#c') IS NOT NULL)
+			DROP TABLE #c
+
+		IF (OBJECT_ID('tempdb..#NUM_A') IS NOT NULL)
+			DROP TABLE #NUM_A
+
+		IF (OBJECT_ID('tempdb..#NUMB1') IS NOT NULL)
+			DROP TABLE #NUMB1
+
+		IF (OBJECT_ID('tempdb..#NUMB2') IS NOT NULL)
+			DROP TABLE #NUMB2
+
+		IF (OBJECT_ID('tempdb..#NUMB_B') IS NOT NULL)
+			DROP TABLE #NUMB_B
+
+		IF (OBJECT_ID('tempdb..#NUMC1') IS NOT NULL)
+			DROP TABLE #NUMC1
+
+		IF (OBJECT_ID('tempdb..#NUMC2') IS NOT NULL)
+			DROP TABLE #NUMC2
+
+		IF (OBJECT_ID('tempdb..#NUM_C') IS NOT NULL)
+			DROP TABLE #NUM_C
+
+		IF (OBJECT_ID('tempdb..#NUMERATORDATA') IS NOT NULL)
+			DROP TABLE #NUMERATORDATA
+
+		IF (OBJECT_ID('tempdb..#aas') IS NOT NULL)
+			DROP TABLE #aas
+
+		IF (OBJECT_ID('tempdb..#bbs') IS NOT NULL)
+			DROP TABLE #bbs
+
+		IF (OBJECT_ID('tempdb..#NUMCX') IS NOT NULL)
+			DROP TABLE #NUMCX
+
+		IF (OBJECT_ID('tempdb..#NUMERATORDATAA') IS NOT NULL)
+			DROP TABLE #NUMERATORDATAA
+
+		IF (OBJECT_ID('tempdb..#NotMet_DenominatorExclusion_Numerator') IS NOT NULL)
+			DROP TABLE #NotMet_DenominatorExclusion_Numerator
+
+		IF (OBJECT_ID('tempdb..#getResult') IS NOT NULL)
+			DROP TABLE #getResult
+
+		IF (OBJECT_ID('tempdb..#fnlResult') IS NOT NULL)
+			DROP TABLE #fnlResult
+	END
+
+	----------------------DROP ALL TEMP TABLES SECTION END
+END
