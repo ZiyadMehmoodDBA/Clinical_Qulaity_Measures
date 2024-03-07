@@ -1,1 +1,1 @@
-This file is baout CQM measures
+This file is about CQM measures
