@@ -1,0 +1,339 @@
+CREATE PROCEDURE [dbo].[CQM_068] --[dbo].[CQM_068_V1] @ProviderId=27970,@PerformanceYear=2024,@FromDate='2024-01-01 00:00:00',@ToDate='2024-12-31 00:00:00',@Practice_Code=21312,@PopulationCriteria=NULL,@Report1=1
+	@ProviderId BIGINT,
+	@PerformanceYear BIGINT,
+	@FromDate DATETIME = NULL,
+	@ToDate DATETIME = NULL,
+	@Practice_Code BIGINT,
+	@PopulationCriteria VARCHAR(500) = NULL,
+	@Report1 INT = 1
+
+AS
+BEGIN
+	SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+	SET NOCOUNT ON;
+
+	DECLARE @TotalPats INT
+	CREATE TABLE #GetAllResultSets (Patient_Account BIGINT, Patient_Name VARCHAR(500), Gender VARCHAR(15), DOB DATETIME, IPOP INT, DENOM INT, NUMER INT, DENEXCL INT, DENEXCEP INT)
+	CREATE TABLE #InitialPopulation (Patient_Account BIGINT, Patient_Ecounter_ID BIGINT, Patient_First_Name VARCHAR(150)
+									, Patient_Last_Name VARCHAR(150), Patient_Name VARCHAR(150), Practice_Code BIGINT
+									, Provider_Code BIGINT, EthnicityID BIGINT, EthnicityDescription VARCHAR(150), RaceID BIGINT
+									, RaceDescription VARCHAR(150), Gender VARCHAR(15), PayerID INT, Payer VARCHAR(255)
+									, BirthDate DATETIME, Age INT, FinancialClassID INT, FinancialClassDescription VARCHAR(255)
+									, InsCode VARCHAR(25), StartDate DATE, EndDate DATE, IPOP INT, DENOM INT);
+
+	IF @FromDate IS NULL OR @ToDate IS NULL
+	BEGIN
+		SET @FromDate = DATEFROMPARTS(@PerformanceYear, 1, 1);
+		SET @ToDate = DATEFROMPARTS(@PerformanceYear, 12, 31);
+	END
+
+	----------------------ENCOUNTER PERFORMED VALUE SET CODING FOR MEASURE NO. 68 SECTION START
+
+	BEGIN
+		SELECT * 
+		INTO #valuseSetCoding 
+		FROM CQM_Test..cqmcodinglist 
+		WHERE Value_Set_OID = '2.16.840.1.113883.3.600.1.1834' AND MeasureNum = '68' AND CMS_ID = 'CMS68v13'
+	END
+
+	----------------------ENCOUNTER PERFORMED VALUE SET CODING FOR MEASURE NO. 68 SECTION END
+
+
+
+	----------------------GET PATIENTS WITH INSURANCES SECTION START
+	
+	BEGIN
+		SELECT DISTINCT p.Patient_Account, p.Patient_First_Name, p.Patient_Last_Name
+			, p.Patient_Last_Name + ', ' + p.Patient_First_Name + ' ' + ISNULL(MiddleName, '') AS Patient_Name
+			, p.Practice_Code, p.Rendering_Physician_Id, p.Gender, DATEDIFF(YEAR, p.Date_of_Birth, GETDATE()) Age, insp.Ins_Payer_Id
+			, insp.Ins_Payer_Name, pati.Financial_Class_ID, fcn.[Description] Financial_Class_Description, fcn.Code Code, p.Date_of_Birth Birth_Date
+		INTO #initialPats
+		FROM Medcare_DB_Dev..Patients p
+			INNER JOIN (SELECT * 
+					    FROM (SELECT ROW_NUMBER() OVER(PARTITION BY Patient_Account ORDER BY Patient_Insurance_ID)idx, * 
+						 	  FROM Medcare_DB_Dev..Patient_Insurance
+						 	  WHERE Deleted = 0 AND Is_Active = 1
+							 ) x 
+					    WHERE idx = 1) pati ON p.Patient_Account = pati.Patient_Account AND pati.Deleted = 0
+			LEFT JOIN Medcare_DB_Dev..Insurance_addresses iaa ON pati.Ins_Address_Id = iaa.Ins_Address_Id AND iaa.Deleted = 0
+			LEFT JOIN Medcare_DB_Dev..Insurance_Payers insp ON iaa.Ins_Payer_Id = insp.Ins_Payer_Id AND insp.Deleted = 0
+			INNER JOIN (SELECT * FROM CQM_Test..cqmcodinglist WHERE Value_Set_Name = 'Payer' AND MeasureNum = '68') fcn ON fcn.Code = insp.typology
+		WHERE p.Deleted = 0
+			AND p.Practice_Code = @Practice_Code
+			--AND p.Patient_Account IN (264656,264655,264654,264665,264664,264663,264662,264661,264660,264659,264658,264657,264963, 264962, 264961, 264960, 264959, 264958, 264957, 264956, 264954, 264953)	--MEASURE PATIENT ACCOUNTS: 264656,264655,264654,264665,264664,264663,264662,264661,264660,264659,264658,264657			
+		ORDER BY p.Patient_Account
+	END
+	
+	----------------------GET PATIENTS WITH INSURANCES SECTION END
+
+
+	----------------------QUALIFYING ENCOUNTERS DURING THE MEASUREMENT PERIOD SECTION START
+	
+	BEGIN
+		INSERT INTO #InitialPopulation (Patient_Account, Patient_Ecounter_ID, Patient_First_Name, Patient_Last_Name, Patient_Name
+										, Practice_Code, Provider_Code, Gender, Age, PayerID, Payer, FinancialClassID
+										, FinancialClassDescription, InsCode, EthnicityID, EthnicityDescription, RaceID, RaceDescription
+										, BirthDate, StartDate, EndDate, IPOP, DENOM) 
+		SELECT pts.Patient_Account, pe.Patient_Encounter_Id, pts.Patient_First_Name, pts.Patient_Last_Name
+			, pts.Patient_First_Name + ' ' + pts.Patient_Last_Name, pts.Practice_Code, pe.Provider_Id Provider_Code, pts.Gender
+			, pts.Age, pts.Ins_Payer_Id, pts.Ins_Payer_Name, pts.Financial_Class_ID, pts.Financial_Class_Description, pts.Code
+			, eth.Ethnicity_Id, eth.Ethnicity, rc.Race_Id, rc.Race, Birth_Date, pe.StartDate, pe.EndDate
+			, COUNT(pts.Patient_Account) OVER(PARTITION BY pts.Patient_Account ORDER BY pts.Patient_Account)
+			, COUNT(pe.Patient_Encounter_Id) OVER(PARTITION BY pts.Patient_Account ORDER BY pe.StartDate)
+		FROM #initialPats pts
+			JOIN Medcare_DB_Dev..[CQM_Encounters] pe ON pts.Patient_Account = pe.Patient_Account
+			JOIN (SELECT Patient_Account,Race_Ethnicity_ID FROM Medcare_DB_Dev..Patient_Race_Ethnicity WHERE [Type] = 'race' AND Deleted = 0) rec ON pts.Patient_Account = rec.Patient_Account
+			JOIN Medcare_DB_Dev..Race rc ON rec.Race_Ethnicity_ID = rc.Race_Id AND rc.Deleted = 0
+			JOIN (SELECT Patient_Account,Race_Ethnicity_ID FROM Medcare_DB_Dev..Patient_Race_Ethnicity WHERE [Type] = 'ethnicity' AND Deleted = 0) ret ON pts.Patient_Account = ret.Patient_Account
+			JOIN Medcare_DB_Dev..Ethnicity eth ON ret.Race_Ethnicity_ID = eth.Ethnicity_ID AND eth.Deleted = 0
+			JOIN #valuseSetCoding vsc ON vsc.Code = pe.Procedure_SNOMED_Code
+		WHERE CAST(pe.StartDate AS DATE) BETWEEN @FromDate AND @ToDate
+			AND ROUND((DATEDIFF(dd, pts.Birth_Date, @FromDate)/365.23076923074), 0) >= 18
+			AND pe.Provider_Id = @ProviderId
+			AND pe.Practice_Code = @Practice_Code
+			AND pe.[Status] = 'Signed'
+	END
+
+	----------------------QUALIFYING ENCOUNTERS DURING THE MEASUREMENT PERIOD SECTION END
+
+
+	----------------------MAKE A DATA SET SECTION START
+	
+	BEGIN
+		INSERT INTO #GetAllResultSets (Patient_Account, Patient_Name, Gender, DOB, IPOP, DENOM, NUMER, DENEXCEP, DENEXCL)  
+		SELECT DISTINCT Patient_Account, Patient_First_Name + ' ' + Patient_Last_Name, Gender, BirthDate, 0, 0, 0, 0, 0
+		FROM #InitialPopulation
+
+		UPDATE ger
+		SET ger.IPOP = x.IPOP, ger.DENOM = x.DENOM
+		FROM #GetAllResultSets ger
+			JOIN (SELECT DISTINCT Patient_Account, Patient_Name, COUNT(DISTINCT Patient_Ecounter_ID) IPOP
+					, COUNT(DISTINCT Patient_Ecounter_ID) DENOM 
+				  FROM #InitialPopulation 
+				  GROUP BY Patient_Account, Patient_Name) x ON ger.Patient_Account = x.Patient_Account
+	END
+
+	----------------------MAKE A DATA SET SECTION END
+
+
+	----------------------NUMERATOR (QUALIFYING ENCOUNTER DURING MEASUREMENT PERIOD WITH PROCEDURE AND INTERVENTION PERFORMED) SECTION START
+	
+	BEGIN
+		SELECT DISTINCT * 
+		INTO #numtem 
+		FROM (SELECT pl.Patient_Account, NULL [Description], pl.Intervention_Code ICD, pl.Intervention_Description ICDDescription
+				, pl.StartDate, pl.EndDate, '2.16.840.1.113883.3.600.1.1834' valueset, fp.Patient_Ecounter_ID 
+			  FROM Medcare_DB_Dev..[CQM_Interventions] pl 
+				INNER JOIN #InitialPopulation fp ON fp.Patient_Account = pl.Patient_Account
+				INNER JOIN Medcare_DB_Dev..Patient_Encounter_Entities pee ON pee.[Entity_Id] = pl.Intervention_Id AND pee.Entity = 'Interventions' AND pee.Patient_Encounter_Id = fp.Patient_Ecounter_ID AND pee.Deleted = 0
+			  WHERE pl.StartDate >= @FromDate
+				AND pl.EndDate <= @ToDate
+				AND pl.Intervention_Code = '428191000124101'
+				AND ISNULL(pl.ActionPerformed, 0) = 'Performed'
+			  UNION
+			  SELECT pl.Patient_Account, NULL [Description], pl.Procedure_Code ICD, pl.Procedure_Description ICDDescription
+				, pl.StartDate, pl.EndDate, '2.16.840.1.113883.3.600.1.1834' valueset, fp.Patient_Ecounter_ID 
+	          FROM Medcare_DB_Dev..[CQM_Procedure_Order_List] pl 
+				INNER JOIN #InitialPopulation fp ON fp.Patient_Account = pl.Patient_Account
+				INNER JOIN Medcare_DB_Dev..Patient_Encounter_Entities pee ON pee.[Entity_Id] = pl.Patient_Procedure_Order_Id AND pee.Patient_Encounter_Id = fp.Patient_Ecounter_ID AND pee.Deleted = 0
+			  WHERE pl.StartDate >= @FromDate
+				AND pl.EndDate <= @ToDate
+				AND pl.Procedure_Code = '428191000124101'
+				AND ISNULL(pl.ActionPerformed, 0) = 1
+			) x 
+	
+		UPDATE ger
+		SET ger.NUMER = x.NUMER
+		FROM #GetAllResultSets ger
+			JOIN (SELECT DISTINCT Patient_Account, COUNT(DISTINCT Patient_Ecounter_ID) numer 
+				  FROM #numtem
+				  GROUP BY Patient_Account) x ON ger.Patient_Account = x.Patient_Account
+	END
+
+	----------------------NUMERATOR (QUALIFYING ENCOUNTER DURING MEASUREMENT PERIOD WITH PROCEDURE AND INTERVENTION PERFORMED) SECTION END
+
+
+
+	----------------------DENOMINATOR EXCEPTION (QUALIFYING ENCOUNTER DURING MEASUREMENT PERIOD WITH PROCEDURE AND INTERVENTION NOT PERFORMED AND MEDICAL REASON) SECTION START
+	
+	BEGIN
+		SELECT pl.Patient_Account, NULL [Description], pl.Intervention_Code ICD, pl.Intervention_Description ICDDescription
+				, pl.StartDate, pl.EndDate, '2.16.840.1.113883.3.600.1.1834' valueset, fp.Patient_Ecounter_ID
+		INTO #DenominatorExceptions
+		FROM Medcare_DB_Dev..[CQM_Interventions] pl 
+			INNER JOIN #InitialPopulation fp ON fp.Patient_Account = pl.Patient_Account
+			INNER JOIN Medcare_DB_Dev..Patient_Encounter_Entities pee ON pee.[Entity_Id] = pl.Intervention_Id AND pee.Entity = 'Interventions' AND pee.Patient_Encounter_Id = fp.Patient_Ecounter_ID AND pee.Deleted = 0
+			INNER JOIN (SELECT * FROM CQM_Test..cqmcodinglist WHERE Value_Set_OID = '2.16.840.1.113883.3.526.3.1007' AND MeasureNum = '68') rea ON rea.Code = pl.Reason_Code
+		WHERE pl.Created_Date BETWEEN @FromDate AND @ToDate
+			AND pl.Intervention_Code = '428191000124101' 
+			AND ISNULL(pl.ActionPerformed, '') = 'Not Performed'
+		UNION
+		SELECT pl.Patient_Account, NULL Description, pl.Procedure_Code ICD, pl.Procedure_Description ICDDescription, pl.StartDate, pl.EndDate
+			, '2.16.840.1.113883.3.600.1.1834' valueset, fp.Patient_Ecounter_ID
+		FROM Medcare_DB_Dev..[CQM_Procedure_Order_List] pl 
+			INNER JOIN #InitialPopulation fp ON fp.Patient_Account = pl.Patient_Account
+			INNER JOIN Medcare_DB_Dev..Patient_Encounter_Entities pee ON pee.[Entity_Id] = pl.Patient_Procedure_Order_Id AND pee.Patient_Encounter_Id = fp.Patient_Ecounter_ID AND pee.Deleted = 0
+			INNER JOIN (SELECT * FROM CQM_Test..cqmcodinglist WHERE Value_Set_OID = '2.16.840.1.113883.3.526.3.1007' AND MeasureNum = '68') rea ON rea.Code = pl.Refusal_Reason_Code
+		WHERE pl.Created_Date BETWEEN @FromDate AND @ToDate
+			AND pl.Procedure_Code = '428191000124101'
+			AND ISNULL(pl.Procedure_Refused, 0) = 1
+					
+		SELECT n.Patient_Account, Patient_Ecounter_ID 
+		INTO #DEx 
+		FROM #DenominatorExceptions n 
+			INNER JOIN (SELECT Patient_Account FROM #InitialPopulation) p ON p.Patient_Account = n.Patient_Account
+
+		----------------------INSERT DATA INTO DENOMINATOR EXCEPTION
+		SELECT s.Patient_Account, '' Description, '' CPTCode, ICDDescription CPTCodeDescription, s.startdate
+			, s.enddate, s.valueset,Patient_Ecounter_ID
+		INTO #DenominatorExceptionData
+		FROM #DenominatorExceptions s 
+			INNER JOIN (SELECT DISTINCT Patient_Account FROM #DEx) b ON s.Patient_Account = b.Patient_Account
+
+		UPDATE ger
+		SET ger.DENEXCEP = ISNULL(cnt,'')
+		FROM #GetAllResultSets ger
+			INNER JOIN (SELECT Patient_Account, COUNT(DISTINCT Patient_Ecounter_ID) cnt 
+					   FROM #DenominatorExceptionData 
+					   GROUP BY Patient_Account) a ON ger.Patient_Account = a.Patient_Account
+	END
+
+	----------------------DENOMINATOR EXCEPTION (QUALIFYING ENCOUNTER DURING MEASUREMENT PERIOD WITH PROCEDURE AND INTERVENTION NOT PERFORMED AND MEDICAL REASON) SECTION END
+
+
+
+	----------------------FINAL RESULT SET SECTION START
+	
+	BEGIN
+		SELECT CAST(Patient_Account AS VARCHAR) Patient_Account, Patient_Name, Gender, DOB, SUM(IPOP) IPOP, SUM(DENOM) DENOM
+			, SUM(NUMER) NUMER, SUM(DENEXCL) DENEXCL, SUM(DENEXCEP) DENEXCEP
+		INTO #getResult 
+		FROM #GetAllResultSets 
+		GROUP BY ROLLUP(CAST(Patient_Account AS VARCHAR), Patient_Name, Gender, DOB)
+
+		-- This IS when we GROUP BY ROLLUP we get extra NULL columns AND grouping of columns so used the machanissm to overcome result
+		SELECT * 
+		INTO #fnlResult 
+		FROM #getResult
+		WHERE Patient_Account IS NOT NULL AND Patient_Name IS NOT NULL AND Gender IS NOT NULL AND DOB IS NOT NULL
+		UNION
+		SELECT * FROM #getResult WHERE Patient_Account IS NULL AND Patient_Name IS NULL 
+
+		SELECT @TotalPats = COUNT(Patient_Account) FROM #fnlResult
+	
+		IF EXISTS (SELECT 1 FROM #fnlResult WHERE Patient_Account IS NULL AND Patient_Name IS NULL)
+		BEGIN
+			UPDATE #fnlResult
+			SET Patient_Account = 'Total'
+			WHERE Patient_Account IS NULL AND Patient_Name IS NULL
+		END
+	END
+
+	----------------------FINAL RESULT SET SECTION END
+
+
+	----------------------RETURN RESULT SET ACCORDING @Report1 PARAM VALUE SECTION START
+	
+	IF @Report1 = 1
+		BEGIN	--RETURNS DATA ON THE BASIS OF POPULATION CRITERIA
+			IF @PopulationCriteria = 'Initial Population'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, IPOP, 0 DENOM, 0 NUMER, 0 DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Denominator'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, DENOM, 0 NUMER, 0 DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE DENOM > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Numerator'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, NUMER, 0 DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE NUMER > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Exclusion'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, 0 NUMER, DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE DENEXCL > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Exception'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, 0 NUMER, 0 DENEXCL, DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE DENEXCEP > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Not Met'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, 0 NUMER, 0 DENEXCL, 0 DENEXCEP, (IPOP - NUMER - DENEXCL - DENEXCEP) NOT_MET
+					FROM #fnlResult
+					WHERE (IPOP - NUMER - DENEXCL - DENEXCEP) <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE
+				BEGIN
+					SELECT fr.*, [NOT_MET] = (IPOP - NUMER - DENEXCL - DENEXCEP) -- A - B - 0 - 0 = X,A - 0 - 0 - 0 = A 
+					FROM #fnlResult fr
+					WHERE IPOP <> 0
+					ORDER BY Patient_Name
+				END
+		END
+	ELSE	
+		BEGIN	--COUNTS FOR TABS ON POPUP OR DASHBOARD
+			SELECT 'CMS68v13' AS MeasureId, @TotalPats AS AllPatientsCount, IPOP InitialPopulationCount
+				, DENOM AS DenominatorCount, NUMER AS NumeratorCount, DENEXCL AS ExclusionCount, DENEXCEP AS ExceptionCount
+				, NotMetCount = (IPOP - NUMER - DENEXCL - DENEXCEP), TotalEncountersCount = IPOP, EncountersCount = NUMER
+			FROM #fnlResult
+			WHERE Patient_Account = 'Total'
+		END
+
+	----------------------RETURN RESULT SET ACCORDING @Report1 PARAM VALUE SECTION END
+
+
+	----------------------DROP ALL TEMP TABLES SECTION START
+	
+	BEGIN
+		IF (OBJECT_ID('tempdb..#valuseSetCoding') IS NOT NULL)
+			DROP TABLE #valuseSetCoding			
+
+		IF (OBJECT_ID('tempdb..#fnlResult') IS NOT NULL)
+			DROP TABLE #fnlResult
+
+		IF (OBJECT_ID('tempdb..#initialPats') IS NOT NULL) 
+			DROP TABLE #initialPats
+
+		IF (OBJECT_ID('tempdb..#InitialPopulation') IS NOT NULL) 
+			DROP TABLE #InitialPopulation
+	
+		IF (OBJECT_ID('tempdb..#GetAllResultSets') IS NOT NULL) 
+			DROP TABLE #GetAllResultSets		
+
+		IF (OBJECT_ID('tempdb..#numtem') IS NOT NULL)
+			DROP TABLE #numtem
+
+		IF (OBJECT_ID('tempdb..#numtema') IS NOT NULL)
+			DROP TABLE #numtema
+
+		IF (OBJECT_ID('tempdb..#DEx') IS NOT NULL)
+			DROP TABLE #DEx
+
+		IF (OBJECT_ID('tempdb..#DenominatorExceptionData') IS NOT NULL)
+			DROP TABLE #DenominatorExceptionData
+
+		IF (OBJECT_ID('tempdb..#getResult') IS NOT NULL)
+			DROP TABLE #getResult
+	END
+
+	----------------------DROP ALL TEMP TABLES SECTION END
+END
+GO
+
+
