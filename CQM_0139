@@ -1,0 +1,381 @@
+CREATE Procedure [dbo].[CQM_0139]
+	@ProviderId BIGINT,
+	@PerformanceYear BIGINT,
+	@FromDate DATETIME = NULL,
+	@ToDate DATETIME = NULL,
+	@Practice_Code BIGINT,
+	@PopulationCriteria VARCHAR(500) = NULL,
+	@Report1 INT = 1
+AS
+BEGIN
+	SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+	SET NOCOUNT ON;
+
+	CREATE TABLE #GetAllResultSets (Patient_Account BIGINT, Patient_Name VARCHAR(500), Gender VARCHAR(15), DOB DATETIME, IPOP INT, DENOM INT, NUMER INT, DENEXCL INT, DENEXCEP INT)
+	CREATE TABLE #ValuesetBasedEncounters (Patient_Account BIGINT, Patient_Ecounter_ID BIGINT, Patient_First_Name VARCHAR(150), Patient_Last_Name VARCHAR(150)
+											, Patient_Name VARCHAR(150), Practice_Code BIGINT, Provider_Code BIGINT, EthnicityID BIGINT, EthnicityDescription VARCHAR(150)
+											, RaceID BIGINT, RaceDescription VARCHAR(150), Gender VARCHAR(15), PayerID INT, Payer VARCHAR(255), BirthDate DATETIME, Age INT
+											, FinancialClassID INT, FinancialClassDescription VARCHAR(255), InsCode VARCHAR(25), StartDate DATE, EndDate DATE, IPOP INT
+											, DENOM INT, VisitType VARCHAR(MAX));
+	CREATE TABLE #InitialPopulation (Patient_Account BIGINT, Patient_Ecounter_ID BIGINT, Patient_First_Name VARCHAR(150), Patient_Last_Name VARCHAR(150)
+									, Patient_Name VARCHAR(150), Practice_Code BIGINT, Provider_Code BIGINT, EthnicityID BIGINT, EthnicityDescription VARCHAR(150)
+									, RaceID BIGINT, RaceDescription VARCHAR(150), Gender VARCHAR(15), PayerID INT, Payer VARCHAR(255), BirthDate DATETIME, Age INT
+									, FinancialClassID INT, FinancialClassDescription VARCHAR(255), InsCode VARCHAR(25), StartDate DATE, EndDate DATE, IPOP INT
+									, DENOM INT);
+
+	IF @FromDate IS NULL OR @ToDate IS NULL
+	BEGIN
+		SET @FromDate = DATEFROMPARTS(@PerformanceYear, 1, 1);
+		SET @ToDate = DATEFROMPARTS(@PerformanceYear, 12, 31);
+	END
+
+	----------------------QUALIFYING ENCOUNTER VALUE SET CODING FOR MEASURE NO. 139 SECTION START
+	
+	BEGIN
+		SELECT Code, Code_System, Value_Set_Name, Value_Set_OID 
+		INTO #valuseSetCoding
+		FROM CQM_Test..cqmcodinglist 
+		WHERE MeasureNum = '139' 
+			AND CMS_ID = 'CMS139v12'
+			AND Value_Set_Name IN ('Annual Wellness Visit'
+									, 'Audiology Visit'
+									, 'Care Services in Long Term Residential Facility'
+									, 'Discharge Services Nursing Facility'
+									, 'Encounter Inpatient'
+									, 'Home Healthcare Services'
+									, 'Hospice Encounter'
+									, 'Nursing Facility Visit'
+									, 'Occupational Therapy Evaluation'
+									, 'Office Visit'
+									, 'Online Assessments'
+									, 'Ophthalmological Services'
+									, 'Physical Therapy Evaluation'
+									, 'Preventive Care Services Established Office Visit, 18 and Up'
+									, 'Preventive Care Services Individual Counseling'
+									, 'Preventive Care Services Initial Office Visit, 18 and Up'									
+									, 'Telephone Visits')
+	END
+
+	----------------------QUALIFYING ENCOUNTER VALUE SET CODING FOR MEASURE NO. 139 SECTION START
+
+
+	----------------------GET PATIENTS WITH INSURANCES SECTION START
+
+	BEGIN
+		SELECT DISTINCT p.Patient_Account, p.Patient_First_Name, p.Patient_Last_Name
+			, p.Patient_Last_Name + ', ' + p.Patient_First_Name + ' ' + ISNULL(MiddleName, '') AS Patient_Name, p.Practice_Code, p.Rendering_Physician_Id
+			, p.Gender, DATEDIFF(YEAR, p.Date_of_Birth, GETDATE()) Age, insp.Ins_Payer_Id, insp.Ins_Payer_Name, pati.Financial_Class_ID
+			, fcn.[Description] Financial_Class_Description, fcn.Code Code, p.Date_of_Birth Birth_Date
+		INTO #initialPats
+		FROM Medcare_DB_Dev..Patients p
+			INNER JOIN (SELECT * 
+					    FROM (SELECT ROW_NUMBER() OVER(PARTITION BY Patient_Account ORDER BY Patient_Insurance_ID)idx, *
+					    	  FROM Medcare_DB_Dev..Patient_Insurance
+					    	  WHERE Deleted = 0 AND Is_Active = 1
+					    	 ) x 
+						WHERE idx = 1) pati ON p.Patient_Account = pati.Patient_Account AND pati.Deleted = 0
+			LEFT JOIN Medcare_DB_Dev..Insurance_addresses iaa ON pati.Ins_Address_Id = iaa.Ins_Address_Id AND iaa.Deleted = 0
+			LEFT JOIN Medcare_DB_Dev..Insurance_Payers insp ON iaa.Ins_Payer_Id = insp.Ins_Payer_Id AND insp.Deleted = 0
+			INNER JOIN (SELECT * FROM CQM_Test..cqmcodinglist WHERE Value_Set_Name = 'Payer' AND MeasureNum = '139') fcn ON fcn.Code = insp.typology
+		WHERE p.Deleted = 0
+			AND p.Practice_Code = @Practice_Code
+			--AND p.Patient_Account IN (264567,264566,264565,264564,264563,264562,264575,264574,264573,264572,264571,264570,264569,264963) --MEASURE PATIENTS: 264567,264566,264565,264564,264563,264562,264575,264574,264573,264572,264571,264570,264569
+		ORDER BY p.Patient_Account
+	END
+
+	----------------------GET PATIENTS WITH INSURANCES SECTION END
+	   	 
+
+	----------------------QUALIFYING ENCOUNTERS WITH A VISIT DURING MEASUREMENT PERIOD SECTION START
+	
+	BEGIN
+		INSERT INTO #ValuesetBasedEncounters (Patient_Account, Patient_Ecounter_ID, Patient_First_Name, Patient_Last_Name, Patient_Name, Practice_Code, Provider_Code
+										, Gender, Age, PayerID, Payer, FinancialClassID, FinancialClassDescription, InsCode, EthnicityID, EthnicityDescription
+										, RaceID, RaceDescription, BirthDate, StartDate, EndDate, IPOP, DENOM, VisitType) 
+		SELECT pts.Patient_Account, pe.Patient_Encounter_Id, pts.Patient_First_Name, pts.Patient_Last_Name
+			, pts.Patient_First_Name + ' ' + pts.Patient_Last_Name, pts.Practice_Code, pe.Provider_Id Provider_Code, pts.Gender, pts.Age, pts.Ins_Payer_Id
+			, pts.Ins_Payer_Name, pts.Financial_Class_ID, pts.Financial_Class_Description, pts.Code, eth.Ethnicity_Id, eth.Ethnicity, rc.Race_Id, rc.Race
+			, Birth_Date, pe.StartDate, pe.EndDate
+			, COUNT(pts.Patient_Account) OVER(PARTITION BY pts.Patient_Account  ORDER BY pts.Patient_Account)
+			, COUNT(pe.Patient_Encounter_Id) OVER(PARTITION BY pts.Patient_Account ORDER BY pe.StartDate)
+			, pe.Visit_Type
+		FROM #initialPats pts
+			JOIN Medcare_DB_Dev..[CQM_Encounters] pe ON pts.Patient_Account = pe.Patient_Account
+			JOIN (SELECT Patient_Account, Race_Ethnicity_ID FROM Medcare_DB_Dev..Patient_Race_Ethnicity WHERE Type = 'race' AND Deleted = 0) rec ON pts.Patient_Account = rec.Patient_Account
+			JOIN Medcare_DB_Dev..Race rc ON rec.Race_Ethnicity_ID = rc.Race_Id AND rc.Deleted = 0
+			JOIN (SELECT Patient_Account, Race_Ethnicity_ID FROM Medcare_DB_Dev..Patient_Race_Ethnicity WHERE Type = 'ethnicity' AND Deleted = 0) ret ON pts.Patient_Account = ret.Patient_Account
+			JOIN Medcare_DB_Dev..Ethnicity eth ON ret.Race_Ethnicity_ID = eth.Ethnicity_ID AND eth.Deleted = 0
+			LEFT JOIN #valuseSetCoding vsc ON vsc.Code = pe.Procedure_SNOMED_Code
+		WHERE pe.StartDate <= @ToDate AND pe.EndDate >= @FromDate
+			AND pe.Provider_Id = @ProviderId
+			AND pe.Practice_Code = @Practice_Code
+			AND pe.[Status] = 'Signed'
+	END
+		
+	----------------------QUALIFYING ENCOUNTERS WITH A VISIT DURING MEASUREMENT PERIOD SECTION END
+	
+
+
+	----------------------INITIAL POPULATION WITH PATIENT AGE >= 65 YEARS AT THE START OF THE MEASUREMENT PERIOD SECTION START
+
+	BEGIN
+		INSERT INTO #InitialPopulation (Patient_Account, Patient_Ecounter_ID, Patient_First_Name, Patient_Last_Name, Patient_Name, Practice_Code, Provider_Code
+										, Gender, Age, PayerID, Payer, FinancialClassID, FinancialClassDescription, InsCode, EthnicityID, EthnicityDescription
+										, RaceID, RaceDescription, BirthDate, StartDate, EndDate, IPOP, DENOM)
+		SELECT Patient_Account, Patient_Ecounter_ID, Patient_First_Name, Patient_Last_Name, Patient_Name, Practice_Code, Provider_Code
+			, Gender, Age, PayerID, Payer, FinancialClassID, FinancialClassDescription, InsCode, EthnicityID, EthnicityDescription
+			, RaceID, RaceDescription, BirthDate, StartDate, EndDate, IPOP, DENOM
+		FROM #ValuesetBasedEncounters
+		WHERE (DATEDIFF(YEAR, BirthDate, @FromDate)) >= 65
+			AND VisitType NOT IN ('Telemedicine Visit', 'Teleconsultation')
+	END
+
+	----------------------INITIAL POPULATION WITH PATIENT AGE >= 65 YEARS AT THE START OF THE MEASUREMENT PERIOD SECTION END
+
+	
+	
+	----------------------MAKE A DATA SET SECTION START
+
+	BEGIN	
+		INSERT INTO #GetAllResultSets (Patient_Account, Patient_Name, Gender, DOB, IPOP, DENOM, NUMER, DENEXCEP, DENEXCL)  
+		SELECT DISTINCT Patient_Account, Patient_Name, Gender, BirthDate, 0, 0, 0, 0, 0 FROM #ValuesetBasedEncounters
+
+		UPDATE ger
+		SET ger.IPOP = x.IPOP, ger.DENOM = x.DENOM
+		FROM #GetAllResultSets ger
+			JOIN (SELECT DISTINCT Patient_Account, Patient_Name, COUNT(DISTINCT Patient_Account) IPOP, COUNT(DISTINCT Patient_Account) DENOM 
+				  FROM #InitialPopulation
+				  GROUP BY Patient_Account, Patient_Name) x ON ger.Patient_Account = x.Patient_Account
+	END
+
+	----------------------MAKE A DATA SET SECTION END
+	
+
+
+	----------------------DENOMINATOR EXCLUSION SECTION START
+	
+	BEGIN
+		-----Encounter, Performed: Encounter Inpatient With Discharge Disposition and Encounter relevant period ends during day of measurement period
+		SELECT pl.Patient_Account, pl.Patient_Name, icds.[Description], pe.Procedure_SNOMED_Code Code
+			, pl.StartDate, pl.EndDate, icds.Value_Set_Name, pl.Patient_Ecounter_ID
+		INTO #DenominatorExclusion
+		FROM #InitialPopulation pl 
+			INNER JOIN Medcare_DB_Dev..[CQM_Encounters] pe ON pe.Patient_Account = pl.Patient_Account
+			INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '139' AND CMS_ID = 'CMS139v12' AND Value_Set_OID = '2.16.840.1.113883.3.666.5.307') icds ON icds.Code = pe.Procedure_SNOMED_Code		
+		WHERE pe.EndDate >= @FromDate AND pe.EndDate <= @ToDate 
+			AND pe.Discharged_To_Code IN ('428371000124100', '428361000124107')
+		UNION
+		-----Encounter, Performed: Hospice Encounter and Encounter relevant period overlaps day of measurement period
+		SELECT pl.Patient_Account, pl.Patient_Name, icds.[Description], pe.Procedure_SNOMED_Code Code
+			, pl.StartDate, pl.EndDate, icds.Value_Set_Name, pl.Patient_Ecounter_ID 
+		FROM #InitialPopulation pl 
+			INNER JOIN Medcare_DB_Dev..[CQM_Encounters] pe ON pe.Patient_Account = pl.Patient_Account
+			INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '139' AND CMS_ID = 'CMS139v12' AND Value_Set_OID = '2.16.840.1.113883.3.464.1003.1003') icds ON icds.Code = pe.Procedure_SNOMED_Code		
+		WHERE pe.StartDate <= @ToDate AND pe.EndDate >= @FromDate
+		UNION
+		-----Intervention, Performed: Hospice Care Ambulatory and Intervention relevant datetime/period overlaps day of measurement period
+		SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.Intervention_Code Code
+			, ipp.StartDate, ipp.EndDate, icds.Value_Set_Name, ipp.Patient_Ecounter_ID
+		FROM Medcare_DB_Dev..CQM_Interventions pl 
+			INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '139' AND CMS_ID = 'CMS139v12' AND Value_Set_OID = '2.16.840.1.113883.3.526.3.1584') icds ON icds.Code = pl.Intervention_Code
+			INNER JOIN #InitialPopulation ipp ON pl.Patient_Account = ipp.Patient_Account
+		WHERE CAST(pl.StartDate AS DATE) BETWEEN @FromDate AND @ToDate 
+			AND ISNULL(pl.ActionPerformed, '') = 'Performed'
+		UNION
+		-----Intervention, Order: Hospice Care Ambulatory and Intervention created datetime during day of measurement period
+		SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.Intervention_Code Code
+			, ipp.StartDate, ipp.EndDate, icds.Value_Set_Name, ipp.Patient_Ecounter_ID
+		FROM Medcare_DB_Dev..CQM_Interventions pl 
+			INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '139' AND CMS_ID = 'CMS139v12' AND Value_Set_OID = '2.16.840.1.113883.3.526.3.1584') icds ON icds.Code = pl.Intervention_Code
+			INNER JOIN #InitialPopulation ipp ON pl.Patient_Account = ipp.Patient_Account
+		WHERE CAST(pl.Created_Date AS DATE) BETWEEN CAST(@FromDate AS DATE) AND CAST(@ToDate AS DATE) 
+			AND ISNULL(pl.ActionPerformed, '') = 'Ordered'
+		UNION
+		-----Assessment, Performed: Hospice care [Minimum Data Set] With 'Yes' result value and Assessment relevant datetime/period overlaps day of measurement period
+		SELECT pl.Patient_Account, ipp.Patient_Name, pl.Assessment [Description], pl.Assessment_Code Code, ipp.StartDate
+			, ipp.EndDate, '' Value_Set_Name, ipp.Patient_Ecounter_ID
+		FROM Medcare_DB_Dev..[CQM_AssessmentList] pl
+			INNER JOIN #InitialPopulation ipp ON pl.Patient_Account = ipp.Patient_Account
+		WHERE CAST(pl.StartDate AS DATE) BETWEEN @FromDate AND @ToDate 
+			AND ISNULL(pl.[Status], '') = 'Performed' 
+			AND pl.Assessment_Code = '45755-6' 
+			AND pl.Result_Id = '373066001'
+		UNION
+		-----Diagnosis: Hospice Diagnosis and Diagnosis period overlaps day of measurement period
+		SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.ICD Code, ipp.StartDate, ipp.EndDate
+			, icds.Value_Set_Name, ipp.Patient_Ecounter_ID
+		FROM Medcare_DB_Dev..CQM_Problemlist pl
+			INNER JOIN #InitialPopulation ipp ON pl.Patient_Account = ipp.Patient_Account
+			INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '139' AND CMS_ID = 'CMS139v12' AND Value_Set_OID = '2.16.840.1.113883.3.464.1003.1165') icds ON icds.Code = pl.ICD
+		WHERE pl.StartDate <= @ToDate AND pl.EndDate >= @FromDate
+
+
+		UPDATE ger
+		SET ger.DENEXCL = x.DENEXCL
+		FROM #GetAllResultSets ger
+			JOIN (SELECT DISTINCT Patient_Account, Patient_Name, COUNT(DISTINCT Patient_Account) DENEXCL
+				  FROM #DenominatorExclusion
+				  GROUP BY Patient_Account, Patient_Name) x ON ger.Patient_Account = x.Patient_Account
+	END
+	
+	----------------------DENOMINATOR EXCLUSION SECTION END
+
+
+	----------------------NUMERATOR (ASSESSMENT PERFORMED WITHIN MEASUREMENT PERIOD) SECTION START
+
+	BEGIN
+		SELECT DISTINCT popa.Patient_Account, popa.Patient_Name 
+		INTO #NotMetInDenominatorExclusion 
+		FROM #InitialPopulation popa
+			LEFT JOIN (SELECT Patient_Account FROM #DenominatorExclusion) de ON popa.Patient_Account = de.Patient_Account
+		WHERE de.Patient_Account IS NULL
+
+		SELECT pl.Patient_Account, ipp.Patient_Name, icds.Description [Description], pl.Assessment_Code Code, pl.Assessment CPTCodeDescription
+			, ipp.startdate, ipp.enddate, icds.Value_Set_Name valueset, ipp.Patient_Ecounter_ID
+		INTO #NumeratorData
+		FROM Medcare_DB_Dev..[CQM_AssessmentList] pl
+			INNER JOIN #NotMetInDenominatorExclusion nde ON nde.Patient_Account = pl.Patient_Account
+			INNER JOIN #InitialPopulation ipp ON ipp.Patient_Account = nde.Patient_Account
+			INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '139' AND CMS_ID = 'CMS139v12' AND Value_Set_OID = '2.16.840.1.113883.3.464.1003.118.12.1028') icds ON icds.Code = pl.Assessment_Code			
+		WHERE (pl.StartDate >= @FromDate AND pl.EndDate <= @ToDate) AND ISNULL(pl.[Status], '') = 'Performed'
+		
+		UPDATE ger
+		SET ger.NUMER = x.NUMER
+		FROM #GetAllResultSets ger
+			JOIN (SELECT DISTINCT Patient_Account, Patient_Name, COUNT(DISTINCT Patient_Account) NUMER
+				  FROM #NumeratorData
+				  GROUP BY Patient_Account, Patient_Name) x ON ger.Patient_Account = x.Patient_Account
+	END
+	
+	----------------------NUMERATOR (ASSESSMENT PERFORMED WITHIN MEASUREMENT PERIOD) SECTION END
+
+
+
+	----------------------FINAL RESULT SET SECTION START
+	
+	BEGIN
+		SELECT CAST(Patient_Account AS VARCHAR) Patient_Account, Patient_Name, Gender, DOB, SUM(IPOP) IPOP, SUM(DENOM) DENOM, SUM(NUMER) NUMER
+			, SUM(DENEXCL) DENEXCL, SUM(DENEXCEP) DENEXCEP
+		INTO #getResult 
+		FROM #GetAllResultSets
+		GROUP BY ROLLUP(CAST(Patient_Account AS VARCHAR), Patient_Name, Gender, DOB)
+
+		-- This IS when we GROUP BY ROLLUP we get extra NULL columns AND grouping of columns so used the machanissm to overcome result
+		SELECT *
+		INTO #fnlResult
+		FROM #getResult
+		WHERE Patient_Account IS NOT NULL AND Patient_Name IS NOT NULL AND Gender IS NOT NULL AND DOB IS NOT NULL
+		UNION ALL
+		SELECT * FROM #getResult WHERE Patient_Account IS NULL AND Patient_Name IS NULL
+
+
+		IF EXISTS (SELECT 1 FROM #fnlResult WHERE Patient_Account IS NULL AND Patient_Name IS NULL)
+		BEGIN
+			UPDATE #fnlResult
+			SET Patient_Account = 'Total'
+			WHERE Patient_Account IS NULL AND Patient_Name IS NULL
+		END
+	END
+
+	----------------------FINAL RESULT SET SECTION END
+
+
+
+	----------------------RETURN RESULT SET ACCORDING @Report1 PARAM VALUE SECTION START
+	
+	IF @Report1 = 1
+		BEGIN	--RETURNS DATA ON THE BASIS OF POPULATION CRITERIA
+			IF @PopulationCriteria = 'Initial Population'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, IPOP, 0 DENOM, 0 NUMER, 0 DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Denominator'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, DENOM, 0 NUMER, 0 DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE DENOM > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Numerator'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, NUMER, 0 DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE NUMER > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Exclusion'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, 0 NUMER, DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE DENEXCL > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Exception'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, 0 NUMER, 0 DENEXCL, DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE DENEXCEP > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'NOT Met'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, 0 NUMER, 0 DENEXCL, 0 DENEXCEP, (IPOP - NUMER - DENEXCL - DENEXCEP) NOT_MET
+					FROM #fnlResult
+					WHERE (IPOP - NUMER - DENEXCL - DENEXCEP) > 0
+					ORDER BY Patient_Name
+				END
+			ELSE
+				BEGIN
+					SELECT fr.*, [NOT_MET] = (IPOP - NUMER - DENEXCL - DENEXCEP) -- A - B - 0 - 0 = X,A - 0 - 0 - 0 = A 
+					FROM #fnlResult fr
+					ORDER BY Patient_Name
+				END		
+		END
+	ELSE
+		BEGIN	--COUNTS FOR TABS ON POPUP OR DASHBOARD
+			SELECT 'CMS139v12' AS MeasureId, (SELECT COUNT(Patient_Account) FROM #GetAllResultSets) AS AllPatientsCount, IPOP InitialPopulationCount
+				, DENOM AS DenominatorCount, NUMER AS NumeratorCount, DENEXCL AS ExclusionCount, DENEXCEP AS ExceptionCount
+				, NotMetCount = (IPOP - NUMER - DENEXCL - DENEXCEP), 0 TotalEncountersCount, 0 EncountersCount
+			FROM #fnlResult
+			WHERE Patient_Account = 'Total'
+		END
+
+	----------------------RETURN RESULT SET ACCORDING @Report1 PARAM VALUE SECTION END
+
+
+	----------------------DROP ALL TEMP TABLES SECTION START
+
+	BEGIN
+		IF (OBJECT_ID('tempdb..#valuseSetCoding') IS NOT NULL)
+			DROP TABLE #valuseSetCoding			
+
+		IF (OBJECT_ID('tempdb..#fnlResult') IS NOT NULL)
+			DROP TABLE #fnlResult
+
+		IF (OBJECT_ID('tempdb..#initialPats') IS NOT NULL) 
+			DROP TABLE #initialPats
+
+		IF (OBJECT_ID('tempdb..#InitialPopulation') IS NOT NULL) 
+			DROP TABLE #InitialPopulation
+	
+		IF (OBJECT_ID('tempdb..#GetAllResultSets') IS NOT NULL) 
+			DROP TABLE #GetAllResultSets
+
+		IF (OBJECT_ID('tempdb..#NumeratorData') IS NOT NULL)
+			DROP TABLE #NumeratorData
+
+		IF (OBJECT_ID('tempdb..#DenominatorExclusion') IS NOT NULL)
+			DROP TABLE #DenominatorExclusion
+
+		IF (OBJECT_ID('tempdb..#getResult') IS NOT NULL)
+			DROP TABLE #getResult
+
+		IF (OBJECT_ID('tempdb..#NotMetInDenominatorExclusion') IS NOT NULL)
+			DROP TABLE #NotMetInDenominatorExclusion
+	END
+
+	----------------------DROP ALL TEMP TABLES SECTION END
+END
