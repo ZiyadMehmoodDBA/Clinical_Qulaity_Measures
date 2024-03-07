@@ -1,0 +1,946 @@
+CREATE Procedure [dbo].[CQM_022]
+	@ProviderId BIGINT,
+	@PerformanceYear BIGINT,
+	@FromDate DATETIME = NULL,
+	@ToDate DATETIME = NULL,
+	@Practice_Code BIGINT,
+	@PopulationCriteria VARCHAR(500) = NULL,
+	@Report1 INT = 1
+AS
+BEGIN
+	SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+	SET NOCOUNT ON;
+
+	CREATE TABLE #GetAllResultSets (Patient_Account BIGINT, Patient_Name VARCHAR(500), Gender VARCHAR(15), DOB DATETIME, IPOP INT, DENOM INT, NUMER INT, DENEXCL INT, DENEXCEP INT)
+	CREATE TABLE #ValuesetBasedEncounters (Patient_Account BIGINT, Patient_Encounter_Id BIGINT, Patient_First_Name VARCHAR(150), Patient_Last_Name VARCHAR(150), Patient_Name VARCHAR(150)
+											, Practice_Code BIGINT, Provider_Code BIGINT, EthnicityID BIGINT, EthnicityDescription VARCHAR(150), RaceID BIGINT, RaceDescription VARCHAR(150)
+											, Gender VARCHAR(15), PayerID INT, Payer VARCHAR(255), BirthDate DATETIME, Age INT, FinancialClassID INT, FinancialClassDescription VARCHAR(255)
+											, InsCode VARCHAR(25), StartDate DATE, EndDate DATE, IPOP INT, DENOM INT, ValueSetOID VARCHAR(500), ValueSetName VARCHAR(MAX), VisitType VARCHAR(MAX));
+	CREATE TABLE #InitialPopulation (Patient_Account BIGINT, Patient_Encounter_Id BIGINT, Patient_First_Name VARCHAR(150), Patient_Last_Name VARCHAR(150), Patient_Name VARCHAR(150)
+									, Practice_Code BIGINT, Provider_Code BIGINT, EthnicityID BIGINT, EthnicityDescription VARCHAR(150), RaceID BIGINT, RaceDescription VARCHAR(150)
+									, Gender VARCHAR(15), PayerID INT, Payer VARCHAR(255), BirthDate DATETIME, Age INT, FinancialClassID INT, FinancialClassDescription VARCHAR(255)
+									, InsCode VARCHAR(25), StartDate DATE, EndDate DATE, IPOP INT, DENOM INT, ValueSetOID VARCHAR(500), ValueSetName VARCHAR(MAX));
+	CREATE TABLE #DenominatorExclusions (Patient_Account BIGINT, Patient_Name VARCHAR(150), Code VARCHAR(100), [Description] VARCHAR(MAX), StartDate DATETIME, EndDate DATETIME
+										, ValueSetName VARCHAR(MAX), Patient_Encounter_Id BIGINT);
+	CREATE TABLE #Numerator (Patient_Account BIGINT, Patient_Name VARCHAR(150), Code VARCHAR(100), [Description] VARCHAR(MAX), StartDate DATETIME, EndDate DATETIME
+							, ValueSetName VARCHAR(MAX), Patient_Encounter_Id BIGINT, VitalDate DATETIME, BP_Value DECIMAL);
+	CREATE TABLE #DenominatorExceptions (Patient_Account BIGINT, Patient_Name VARCHAR(150), Code VARCHAR(100), [Description] VARCHAR(MAX), StartDate DATETIME, EndDate DATETIME
+										, ValueSetName VARCHAR(MAX), Patient_Encounter_Id BIGINT);
+
+	DECLARE @TotalPats INT
+
+
+
+	IF @FromDate IS NULL OR @ToDate IS NULL
+	BEGIN
+		SET @FromDate = DATEFROMPARTS(@PerformanceYear, 1, 1);
+		SET @ToDate = DATEFROMPARTS(@PerformanceYear, 12, 31);
+	END
+
+
+	
+	----------------------QUALIFYING ENCOUNTER VALUE SET CODING FOR MEASURE NO. 22 SECTION START
+
+	BEGIN
+		SELECT Code, Code_System, Value_Set_Name, Value_Set_OID 
+		INTO #valuseSetCoding
+		FROM CQM_Test..cqmcodinglist 
+		WHERE MeasureNum = '22' AND CMS_ID = 'CMS22v12' AND Value_Set_Name = 'Encounter to Screen for Blood Pressure'		--2.16.840.1.113883.3.600.1920
+	END
+
+	----------------------QUALIFYING ENCOUNTER VALUE SET CODING FOR MEASURE NO. 22 SECTION END
+	
+
+
+	----------------------GET PATIENTS WITH INSURANCES SECTION START
+
+	BEGIN
+		SELECT DISTINCT p.Patient_Account, p.Patient_First_Name, p.Patient_Last_Name
+			, p.Patient_Last_Name + ', ' + p.Patient_First_Name + ' ' + ISNULL(MiddleName,'') AS Patient_Name, p.Practice_Code, p.Rendering_Physician_Id
+			, p.Gender, DATEDIFF(YEAR, p.Date_of_Birth, GETDATE()) Age, insp.Ins_Payer_Id, insp.Ins_Payer_Name, pati.Financial_Class_ID
+			, fcn.[Description] Financial_Class_Description, fcn.Code, p.Date_of_Birth Birth_Date
+		INTO #initialPats
+		FROM Medcare_DB_Dev..Patients p
+			INNER JOIN (SELECT * 
+					    FROM (SELECT ROW_NUMBER() OVER(PARTITION BY Patient_Account ORDER BY Patient_Insurance_ID)idx, *
+						 	  FROM Medcare_DB_Dev..Patient_Insurance
+						 	  WHERE Deleted = 0 AND Is_Active = 1
+						 	 ) x 
+					    WHERE idx = 1) pati ON p.Patient_Account = pati.Patient_Account AND pati.Deleted = 0
+			LEFT JOIN Medcare_DB_Dev..Insurance_addresses iaa ON pati.Ins_Address_Id = iaa.Ins_Address_Id AND iaa.Deleted = 0
+			LEFT JOIN Medcare_DB_Dev..Insurance_Payers insp ON iaa.Ins_Payer_Id = insp.Ins_Payer_Id AND insp.Deleted = 0
+			INNER JOIN (SELECT * FROM CQM_Test..cqmcodinglist WHERE Value_Set_Name = 'Payer' AND MeasureNum = '22') fcn ON fcn.Code = insp.typology
+		WHERE p.Deleted = 0 
+			AND p.Practice_Code = @Practice_Code
+			--AND p.Patient_Account IN (264365,264366,264378,264379,264380,264382,264383,264384,264385,264386,264387,264388)
+	END
+
+	----------------------GET PATIENTS WITH INSURANCES SECTION END
+	
+
+
+	----------------------PATIENT AGE >= 18 YEARS AT THE START OF THE MEASUREMENT PERIOD WITH A VISIT DURING MEASUREMENT PERIOD SECTION START
+
+	BEGIN
+		INSERT INTO #ValuesetBasedEncounters (Patient_Account, Patient_Encounter_Id, Patient_First_Name, Patient_Last_Name, Patient_Name, Practice_Code, Provider_Code, Gender
+												, Age, PayerID, Payer, FinancialClassID, FinancialClassDescription, InsCode, EthnicityID, EthnicityDescription, RaceID
+												, RaceDescription, BirthDate, StartDate, EndDate, IPOP, DENOM, ValueSetOID, ValueSetName, VisitType) 
+		SELECT pts.Patient_Account, pe.Patient_Encounter_Id, pts.Patient_First_Name, pts.Patient_Last_Name, pts.Patient_First_Name + ' ' + pts.Patient_Last_Name
+			, pts.Practice_Code, pe.Provider_Id Provider_Code, pts.Gender, pts.Age, pts.Ins_Payer_Id, pts.Ins_Payer_Name, pts.Financial_Class_ID
+			, pts.Financial_Class_Description, pts.Code, eth.Ethnicity_Id, eth.Ethnicity, rc.Race_Id, rc.Race, Birth_Date, pe.StartDate, pe.EndDate
+			, COUNT(pts.Patient_Account) OVER(PARTITION BY pts.Patient_Account ORDER BY pts.Patient_Account)
+			, COUNT(pe.Patient_Encounter_Id) OVER(PARTITION BY pts.Patient_Account ORDER BY pe.StartDate)
+			, vsc.Value_Set_OID, vsc.Value_Set_Name, pe.Visit_Type
+		FROM #initialPats pts
+			INNER JOIN Medcare_DB_Dev..[CQM_Encounters] pe ON pts.Patient_Account = pe.Patient_Account
+			INNER JOIN (SELECT Patient_Account,Race_Ethnicity_ID FROM Medcare_DB_Dev..Patient_Race_Ethnicity WHERE Type = 'race' AND Deleted = 0) rec ON pts.Patient_Account = rec.Patient_Account
+			INNER JOIN Medcare_DB_Dev..Race rc ON rec.Race_Ethnicity_ID = rc.Race_Id AND rc.Deleted = 0
+			INNER JOIN (SELECT Patient_Account,Race_Ethnicity_ID FROM Medcare_DB_Dev..Patient_Race_Ethnicity WHERE Type = 'ethnicity' AND Deleted = 0) ret ON pts.Patient_Account = ret.Patient_Account
+			INNER JOIN Medcare_DB_Dev..Ethnicity eth ON ret.Race_Ethnicity_ID = eth.Ethnicity_ID AND eth.Deleted = 0
+			INNER JOIN #valuseSetCoding vsc ON pe.Procedure_SNOMED_Code = vsc.Code
+		WHERE ROUND((DATEDIFF(dd, pts.Birth_Date, @FromDate)/365.23076923074), 0) >= 18 
+			AND (pe.StartDate >= @FromDate AND pe.EndDate <= @ToDate)
+			AND pe.Provider_Id = @ProviderId
+			AND pe.Practice_Code = @Practice_Code
+			AND pe.[Status] = 'Signed'			
+	END
+
+	----------------------PATIENT AGE >= 18 YEARS AT THE START OF THE MEASUREMENT PERIOD WITH A VISIT DURING MEASUREMENT PERIOD SECTION END
+	
+
+
+	----------------------INITIAL POPULATION WITH ENCOUNTER TO SCREEN FOR BP VALUSET SECTION START
+
+	BEGIN
+		------Encounter, Performed: Encounter to Screen for Blood Pressure where Encounter relevant period during day of Measurement Period and Encounter Type != Virtual
+		INSERT INTO #InitialPopulation (Patient_Account, Patient_Encounter_Id, Patient_First_Name, Patient_Last_Name, Patient_Name, Practice_Code, Provider_Code, Gender
+										, Age, PayerID, Payer, FinancialClassID, FinancialClassDescription, InsCode, EthnicityID, EthnicityDescription, RaceID
+										, RaceDescription, BirthDate, StartDate, EndDate, IPOP, DENOM, ValueSetOID, ValueSetName) 
+		SELECT Patient_Account, Patient_Encounter_Id, Patient_First_Name, Patient_Last_Name, Patient_Name, Practice_Code, Provider_Code, Gender, Age, PayerID, Payer
+			, FinancialClassID, FinancialClassDescription, InsCode, EthnicityID, EthnicityDescription, RaceID, RaceDescription, BirthDate, StartDate, EndDate, IPOP
+			, DENOM, ValueSetOID, ValueSetName
+		FROM #ValuesetBasedEncounters
+		WHERE ValueSetOID = '2.16.840.1.113883.3.600.1920'				--Encounter to Screen for Blood Pressure
+			AND VisitType NOT IN ('Telemedicine Visit', 'Teleconsultation')
+	END
+
+	----------------------INITIAL POPULATION WITH ENCOUNTER TO SCREEN FOR BP VALUSET SECTION END
+
+
+
+	----------------------MAKE A DATA SET SECTION START
+
+	BEGIN
+		INSERT INTO #GetAllResultSets (Patient_Account, Patient_Name, Gender, DOB, IPOP, DENOM, NUMER, DENEXCEP, DENEXCL)  
+		SELECT DISTINCT Patient_Account, Patient_Name, Gender, BirthDate, 0, 0, 0, 0, 0 FROM #ValuesetBasedEncounters  
+
+		UPDATE ger
+		SET ger.IPOP = x.IPOP, ger.DENOM = x.DENOM
+		FROM #GetAllResultSets ger
+			INNER JOIN (SELECT DISTINCT Patient_Account, Patient_Name, COUNT(DISTINCT Patient_Encounter_Id) IPOP, COUNT(DISTINCT Patient_Encounter_Id) DENOM 
+						FROM #InitialPopulation
+						GROUP BY Patient_Account, Patient_Name) x ON ger.Patient_Account = x.Patient_Account
+	END
+
+	----------------------MAKE A DATA SET SECTION END
+
+
+
+	----------------------DENOMINATOR EXCLUSIONS (QUALIFYING ENCOUNTER DURING MEASUREMENT PERIOD WITH DIAGNOSIS OF HYPERTENSION) SECTION START
+
+	BEGIN
+		INSERT INTO #DenominatorExclusions (Patient_Account, Patient_Name, [Description], Code, StartDate, EndDate, ValueSetName, Patient_Encounter_Id)
+		SELECT pl.Patient_Account, ipp.Patient_Name, icds.[Description], pl.ICD Code, ipp.StartDate, ipp.EndDate
+			, icds.Value_Set_Name, ipp.Patient_Encounter_Id
+		FROM Medcare_DB_Dev..CQM_Problemlist pl
+			INNER JOIN #InitialPopulation ipp ON pl.Patient_Account = ipp.Patient_Account
+			INNER JOIN (SELECT * FROM cqmcodinglist WHERE MeasureNum = '22' AND CMS_ID = 'CMS22v12' AND Value_Set_OID = '2.16.840.1.113883.3.600.263') icds ON icds.Code = pl.ICD
+		WHERE pl.EndDate < ipp.StartDate
+
+
+		UPDATE ger
+		SET ger.DENEXCL = x.DENEXCL
+		FROM #GetAllResultSets ger
+			INNER JOIN (SELECT DISTINCT Patient_Account, Patient_Name, COUNT(DISTINCT Patient_Encounter_Id) DENEXCL
+						FROM #DenominatorExclusions
+						GROUP BY Patient_Account, Patient_Name) x ON ger.Patient_Account = x.Patient_Account
+	END
+
+	----------------------DENOMINATOR EXCLUSIONS (QUALIFYING ENCOUNTER DURING MEASUREMENT PERIOD WITH DIAGNOSIS OF HYPERTENSION) SECTION END
+	
+
+
+	----------------------NUMERATOR SECTION START
+
+	--BEGIN
+	--	SELECT DISTINCT popa.Patient_Account, popa.Patient_Name 
+	--	INTO #NotMetDenominatorExclusion 
+	--	FROM #ValuesetBasedEncounters popa
+	--		LEFT JOIN (SELECT Patient_Account FROM #DenominatorExclusions) de ON popa.Patient_Account = de.Patient_Account
+	--	WHERE de.Patient_Account IS NULL
+
+
+		------------------------ENCOUNTER WITH NORMAL BP READING SECTION START
+
+		--BEGIN
+		--	------Physical Exam, Performed: Systolic blood pressure where relevant datetime ends during Encounter relevantPeriod, sort by start of relevant datetime
+		--	BEGIN
+		--		SELECT ipp.Patient_Account, ipp.Patient_Name, bp.BP_Systolic, bp.Vital_Datetime, ipp.StartDate, ipp.EndDate
+		--		INTO #SystolicBP
+		--		FROM #NotMetDenominatorExclusion de
+		--			INNER JOIN Medcare_DB_Dev..CQM_Vitals_BP bp ON bp.Patient_Account = de.Patient_Account
+		--			INNER JOIN #InitialPopulation ipp ON ipp.Patient_Account = bp.Patient_Account
+		--		WHERE bp.Vital_Datetime <= ipp.EndDate AND bp.BP_Systolic > 0
+		--		GROUP BY ipp.Patient_Account, ipp.Patient_Name, bp.BP_Systolic, bp.Vital_Datetime, ipp.StartDate, ipp.EndDate
+		--		ORDER BY bp.Vital_Datetime ASC
+
+		--		SELECT Patient_Account, Patient_Name, MAX(BP_Systolic) AS Systolic, MAX(Vital_Datetime) AS Vital_Date
+		--		INTO #LastSystolicBP
+		--		FROM #SystolicBP
+		--		GROUP BY Patient_Account, Patient_Name
+		--	END
+
+		--	------Physical Exam, Performed: Diastolic blood pressure where relevant datetime ends during Encounter relevantPeriod, sort by start of relevant datetime
+		--	BEGIN
+		--		SELECT ipp.Patient_Account, ipp.Patient_Name, bp.BP_Diastolic, bp.Vital_Datetime, ipp.StartDate, ipp.EndDate
+		--		INTO #DiastolicBP
+		--		FROM #NotMetDenominatorExclusion de
+		--			INNER JOIN Medcare_DB_Dev..CQM_Vitals_BP bp ON bp.Patient_Account = de.Patient_Account
+		--			INNER JOIN #InitialPopulation ipp ON ipp.Patient_Account = bp.Patient_Account
+		--		WHERE bp.Vital_Datetime <= ipp.EndDate AND bp.BP_Diastolic > 0
+		--		GROUP BY ipp.Patient_Account, ipp.Patient_Name, bp.BP_Diastolic, bp.Vital_Datetime, ipp.StartDate, ipp.EndDate
+		--		ORDER BY bp.Vital_Datetime ASC
+
+		--		SELECT Patient_Account, Patient_Name, MAX(BP_Diastolic) AS Diastolic, MAX(Vital_Datetime) AS Vital_Date
+		--		INTO #LastDiastolicBP
+		--		FROM #DiastolicBP
+		--		GROUP BY Patient_Account, Patient_Name
+		--	END
+
+		--	INSERT INTO #Numerator (Patient_Account, Patient_Name, VitalDate, BP_Value)
+		--	SELECT Patient_Account, Patient_Name, Vital_Date, Systolic FROM #LastSystolicBP WHERE Systolic >= 1 AND Systolic <= 120
+		--	UNION
+		--	SELECT Patient_Account, Patient_Name, Vital_Date, Diastolic FROM #LastDiastolicBP WHERE Diastolic >= 1 AND Diastolic <= 80
+		--END
+
+		------------------------ENCOUNTER WITH NORMAL BP READING SECTION END
+
+
+	--	UPDATE ger
+	--	SET ger.NUMER = x.NUMER
+	--	FROM #GetAllResultSets ger
+	--		INNER JOIN (SELECT DISTINCT Patient_Account, Patient_Name, COUNT(DISTINCT Patient_Encounter_Id) NUMER
+	--					FROM #Numerator
+	--					GROUP BY Patient_Account, Patient_Name) x ON ger.Patient_Account = x.Patient_Account
+	--END
+
+	----------------------NUMERATOR SECTION END
+
+	Select * Into #cqm_22 from (
+select Code,Code_System,value_set_Name,Value_Set_OID,Description  
+from CQM_Test..cqmcodinglist 
+where MeasureNum = '22' 
+and Value_Set_OID = '2.16.840.1.113883.3.526.3.1581' --Lifestyle Recommendation 
+and CMS_ID = 'CMS22v12'
+UNION ALL
+select Code,Code_System,value_set_Name,Value_Set_OID,Description  
+from CQM_Test..cqmcodinglist 
+where MeasureNum = '22' 
+and Value_Set_OID = '2.16.840.1.113883.3.600.1510' --Weight Reduction Recommended
+and CMS_ID = 'CMS22v12'
+UNION ALL
+select Code,Code_System,value_set_Name,Value_Set_OID,Description  
+from CQM_Test..cqmcodinglist 
+where MeasureNum = '22' 
+and Value_Set_OID = '2.16.840.1.113883.3.600.1515' --Dietary Recommendations 
+and CMS_ID = 'CMS22v12'
+UNION ALL
+select Code,Code_System,value_set_Name,Value_Set_OID,Description  
+from CQM_Test..cqmcodinglist 
+where MeasureNum = '22' 
+and Value_Set_OID = '2.16.840.1.113883.3.600.1518' --Recommendation to Increase Physical Activity 
+and CMS_ID = 'CMS22v12'
+UNION ALL
+select Code,Code_System,value_set_Name,Value_Set_OID,Description  
+from CQM_Test..cqmcodinglist 
+where MeasureNum = '22' 
+and Value_Set_OID = '2.16.840.1.113883.3.526.3.1583' --Referral or Counseling for Alcohol Consumption 
+and CMS_ID = 'CMS22v12'
+) X 
+
+
+	--BP Screening Encounter Codes
+		SELECT pl.Patient_Account,icds.[Description],pl.procedure_SNOMED_Code ICD,'' ICDDescription,'' title,pl.Code_Type DataType,pl.startdate,pl.enddate
+		,icds.Value_Set_OID valueset ,pl.Patient_Encounter_Id,ROW_NUMBER() Over(Partition by pl.Patient_Account order by pl.startdate desc) RowId
+		into #P222
+		from Medcare_DB_Dev..[CQM_Encounters] pl 
+		inner join(select * from CQM_Test..cqmcodinglist  where MeasureNum = '22' and Value_Set_OID = '2.16.840.1.113883.3.600.1920' and CMS_ID = 'CMS22v12')  
+		icds on icds.Code=pl.procedure_SNOMED_Code --Referral or Counseling for Alcohol Consumption
+		inner join #InitialPopulation ipp ON pl.Patient_Account = ipp.Patient_Account
+		WHERE pl.StartDate  BETWEEN @FromDate  AND @ToDate
+
+
+	select Patient_Account,min(cast(Startdate as date))startdate,max(cast(EndDate as date))EndDate into #PBP from #InitialPopulation
+	group by Patient_Account--,Patient_Ecounter_ID
+
+	select Patient_Account,[Description],ICD,ICDDescription,title,DataType,cast(startdate as date)startdate,cast(enddate as date)enddate,valueset ,Patient_Encounter_Id into #PBPMostRecent 
+	from #P222 where RowId = 1
+
+
+	SELECT pl.Patient_Account,icds.Description [Description],pl.Intervention_Code ICD,Value_Set_OID,pl.ActionPerformed
+	into #QDM
+	from Medcare_DB_Dev..[CQM_Interventions] pl 
+	inner Join #cqm_22 icds ON icds.Code = pl.Intervention_Code
+	inner join #PBP pbp on pbp.Patient_Account =pl.Patient_Account
+	inner join #InitialPopulation fp on fp.Patient_Account = pl.Patient_Account
+	WHERE pl.StartDate  > pbp.startdate
+
+	begin -- numenator
+
+	select distinct popa.* 
+	into #NLessDc 
+	from #InitialPopulation popa
+	left join (select Patient_Account from #DenominatorExclusions) de on popa.Patient_Account = de.Patient_Account 
+	where de.Patient_Account is null
+
+	BEGIN --Encounter with Normal Blood Pressure Reading Starts
+	--Normal BP
+	Select * Into #NSBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBP pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_Systolic,0) <'120'
+	and  vs.Vital_Date  <= pbp.EndDate and vs.Vital_Date >= pbp.StartDate
+	and vs.Deleted = 0
+	) y  Where RowId = 1
+
+
+	Select * Into #NDBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBP pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_diastolic,0) < '80' 
+	and  vs.Vital_Date  <= pbp.EndDate and vs.Vital_Date >= pbp.StartDate
+	and vs.Deleted = 0
+	) t Where RowId = 1
+	
+	
+
+	Select Patient_Account,Patient_Encounter_Id INTO #NBPR from #NSBP
+	UNION ALL
+	Select Patient_Account,Patient_Encounter_Id from #NDBP
+	END --Part1: Encounter with Normal Blood Pressure Reading Ends
+
+
+
+	BEGIN --Encounter with Elevated Blood Pressure Reading SBP 120 to 129 AND DBP less than 80 Starts
+	--Elevated BP
+	Select * Into #ESBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBP pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_Systolic,0) >'120' and isnull(vsb.BP_Systolic,0) < '140'
+	and  vs.Vital_Date  <= pbp.EndDate and vs.Vital_Date >= pbp.StartDate
+	and vs.Deleted = 0
+	) y  Where RowId = 1
+
+
+	Select * Into #EDBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBP pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_diastolic,0) < '80' 
+	and  vs.Vital_Date  <= pbp.EndDate and vs.Vital_Date >= pbp.StartDate
+	and vs.Deleted = 0
+	) t Where RowId = 1
+	
+	
+
+	Select Patient_Account,Patient_Encounter_Id INTO #EBPR from #ESBP
+	UNION ALL
+	Select Patient_Account,Patient_Encounter_Id from #EDBP
+
+	END --Part2: Encounter with Elevated Blood Pressure Reading SBP 120 to 129 AND DBP less than 80 Ends
+
+	BEGIN --Encounter with Elevated Blood Pressure Reading SBP 120 to 129 AND DBP less than 80 and Interventions Starts
+	--Elevated BP
+	Select * Into #EISBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,pbp.Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBPMostRecent pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_Systolic,0) >'120' and isnull(vsb.BP_Systolic,0) < '140'
+	and  vs.Vital_Date  <= pbp.EndDate and vs.Vital_Date >= pbp.StartDate
+	and vs.Deleted = 0
+	) y  Where RowId = 1
+
+
+	Select * Into #EIDBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,pbp.Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBPMostRecent pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_diastolic,0) < '90' 
+	and  vs.Vital_Date  <= pbp.EndDate and vs.Vital_Date >= pbp.StartDate
+	and vs.Deleted = 0
+	) t Where RowId = 1
+	
+	
+
+	Select Patient_Account,Patient_Encounter_Id INTO #EIBPR from #EISBP
+	UNION ALL
+	Select Patient_Account,Patient_Encounter_Id from #EIDBP
+
+	END --Part4: Encounter with Elevated Blood Pressure Reading SBP 120 to 129 AND DBP less than 80 and Interventions Ends
+
+		BEGIN --Encounter with First Hypertensive Reading SBP Greater than or Equal to 130 OR DBP Greater than or Equal to 80 Starts
+	--Elevated BP
+	Select * Into #EGSBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBP pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_Systolic,0) >='130' --and isnull(vsb.BP_Systolic,0) < '140'
+	and  vs.Vital_Date  <= pbp.EndDate and vs.Vital_Date >= pbp.StartDate
+	and vs.Deleted = 0
+	) y  Where RowId = 1
+
+
+	Select * Into #EGDBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBP pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_diastolic,0) >= '80' And isnull(vsb.BP_diastolic,0) < '90' 
+	and  vs.Vital_Date  <= pbp.EndDate and vs.Vital_Date >= pbp.StartDate
+	and vs.Deleted = 0
+	) t Where RowId = 1
+	
+	
+
+	Select Patient_Account,Patient_Encounter_Id INTO #EGBPR from #EGSBP
+	UNION ALL
+	Select Patient_Account,Patient_Encounter_Id from #EGDBP
+
+	END --Part5: Encounter with First Hypertensive Reading SBP Greater than or Equal to 130 OR DBP Greater than or Equal to 80 Ends
+
+	BEGIN --Encounter with First Hypertensive Reading SBP Greater than or Equal to 130 OR DBP Greater than or Equal to 80 and Interventions Starts
+	--Elevated BP
+	Select * Into #EGISBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,pbp.Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBPMostRecent pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_Systolic,0) >='130' --and isnull(vsb.BP_Systolic,0) < '140'
+	and  vs.Vital_Date  <= pbp.EndDate and vs.Vital_Date >= pbp.StartDate
+	and vs.Deleted = 0
+	) y  Where RowId = 1
+
+
+	Select * Into #EGIDBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,pbp.Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBPMostRecent pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_diastolic,0) >= '80' And isnull(vsb.BP_diastolic,0) < '90' 
+	and  vs.Vital_Date  <= pbp.EndDate and vs.Vital_Date >= pbp.StartDate
+	and vs.Deleted = 0
+	) t Where RowId = 1
+	
+	
+
+	Select Patient_Account,Patient_Encounter_Id INTO #EGIBPR from #EGISBP
+	UNION ALL
+	Select Patient_Account,Patient_Encounter_Id from #EGIDBP
+
+	END --Part6: Encounter with First Hypertensive Reading SBP Greater than or Equal to 130 OR DBP Greater than or Equal to 80 and Interventions Ends
+
+	BEGIN --Encounter with Hypertensive Reading Within Year Prior Starts
+	--Elevated BP
+	Select * Into #EPRSBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBP pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_Systolic,0) >='130' --and isnull(vsb.BP_Systolic,0) < '140'
+	and  vs.Vital_Date  between  dateadd(year,-1,pbp.StartDate) and pbp.StartDate
+	and vs.Deleted = 0
+	) y  Where RowId = 1
+
+
+	Select * Into #EPRDBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBP pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_diastolic,0) >= '80'
+	and  vs.Vital_Date  between  dateadd(year,-1,pbp.StartDate) and pbp.StartDate
+	and vs.Deleted = 0
+	) t Where RowId = 1
+	
+	
+
+	Select Patient_Account,Patient_Encounter_Id INTO #EPRBPR from #EPRSBP
+	UNION ALL
+	Select Patient_Account,Patient_Encounter_Id from #EPRDBP
+
+	END --Part7: Encounter with Hypertensive Reading Within Year Prior Ends
+	
+
+	BEGIN --Encounter with Second Hypertensive Reading SBP 130 to 139 OR DBP 80 to 89 Starts
+	--Elevated BP
+	Select * Into #E2SBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBP pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_Systolic,0) >='130' and isnull(vsb.BP_Systolic,0) < '140'
+	and  vs.Vital_Date  between  dateadd(year,-1,pbp.StartDate) and pbp.StartDate
+	and vs.Deleted = 0
+	) y  Where RowId = 1
+
+
+	Select * Into #E2DBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBP pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_diastolic,0) >= '80' and isnull(vsb.BP_diastolic,0) < '90'
+	and  vs.Vital_Date  between  dateadd(year,-1,pbp.StartDate) and pbp.StartDate
+	and vs.Deleted = 0
+	) t Where RowId = 1
+	
+	
+
+	Select Patient_Account,Patient_Encounter_Id INTO #E2BPR from #E2SBP
+	UNION ALL
+	Select Patient_Account,Patient_Encounter_Id from #E2DBP
+
+	END --Part8: Encounter with Second Hypertensive Reading SBP 130 to 139 OR DBP 80 to 89 Ends
+
+	BEGIN --Encounter with Second Hypertensive Reading SBP 130 to 139 OR DBP 80 to 89 and Interventions Starts
+	--Elevated BP
+	Select * Into #E2ISBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,pbp.Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBPMostRecent pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_Systolic,0) >='130' and isnull(vsb.BP_Systolic,0) < '140'
+	and  vs.Vital_Date  between  dateadd(year,-1,pbp.StartDate) and pbp.StartDate
+	and vs.Deleted = 0
+	) y  Where RowId = 1
+
+
+	Select * Into #E2IDBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,pbp.Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBPMostRecent pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_diastolic,0) >= '80' and isnull(vsb.BP_diastolic,0) < '90'
+	and  vs.Vital_Date  between  dateadd(year,-1,pbp.StartDate) and pbp.StartDate
+	and vs.Deleted = 0
+	) t Where RowId = 1
+	
+	
+
+	Select Patient_Account,Patient_Encounter_Id INTO #E2IBPR from #E2ISBP
+	UNION ALL
+	Select Patient_Account,Patient_Encounter_Id from #E2IDBP
+
+	END --Part9: Encounter with Second Hypertensive Reading SBP 130 to 139 OR DBP 80 to 89 Ends
+
+	BEGIN --Encounter with Second Hypertensive Reading SBP Greater than or Equal to 140 OR DBP Greater than or Equal to 90 Starts
+	--Elevated BP
+	Select * Into #E140SBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBP pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_Systolic,0) >='140' 
+	and  vs.Vital_Date  between  dateadd(year,-1,pbp.StartDate) and pbp.StartDate
+	and vs.Deleted = 0
+	) y  Where RowId = 1
+
+
+	Select * Into #E140DBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBP pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_diastolic,0) >= '90'
+	and  vs.Vital_Date  between  dateadd(year,-1,pbp.StartDate) and pbp.StartDate
+	and vs.Deleted = 0
+	) t Where RowId = 1
+	
+	
+
+	Select Patient_Account,Patient_Encounter_Id INTO #E140BPR from #E140SBP
+	UNION ALL
+	Select Patient_Account,Patient_Encounter_Id from #E140DBP
+
+	END --Part9: Encounter with Second Hypertensive Reading SBP Greater than or Equal to 140 OR DBP Greater than or Equal to 90 Ends
+
+	BEGIN --Encounter with Second Hypertensive Reading SBP Greater than or Equal to 140 OR DBP Greater than or Equal to 90 and Interventions Starts
+	--Elevated BP
+	Select * Into #E140ISBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,pbp.Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBPMostRecent pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_Systolic,0) >='140' 
+	and  vs.Vital_Date  between  dateadd(year,-1,pbp.StartDate) and pbp.StartDate
+	and vs.Deleted = 0
+	) y  Where RowId = 1
+
+
+	Select * Into #E140IDBP from (
+	SELECT n.Patient_Account,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.Vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,isnull(vsb.BP_Systolic,0) as Result,pbp.Patient_Encounter_Id
+	,Row_Number() over(Partition by vs.Patient_Account order by vsb.Created_date desc) RowId
+	FROM  #NLessDc n 
+	inner join Medcare_DB_Dev..Patient_Vitals vs on vs.Patient_Account =n.Patient_Account
+	inner join Medcare_DB_Dev..Patient_Vitals_Blood_Pressure_Extended vsb  on vsb.Patient_Vitals_id = vs.Patient_Vitals_id
+	inner join #PBPMostRecent pbp ON pbp.Patient_Account = vs.Patient_Account
+	where isnull(vsb.BP_diastolic,0) >= '90'
+	and  vs.Vital_Date  between  dateadd(year,-1,pbp.StartDate) and pbp.StartDate
+	and vs.Deleted = 0
+	) t Where RowId = 1
+	
+	
+
+	Select Patient_Account,Patient_Encounter_Id INTO #E140IBPR from #E140ISBP
+	UNION ALL
+	Select Patient_Account,Patient_Encounter_Id from #E140IDBP
+
+	END --Part10: Encounter with Second Hypertensive Reading SBP Greater than or Equal to 140 OR DBP Greater than or Equal to 90 and Interventions Ends
+
+		Select * INTO #Num FROM #NBPR
+		UNION ALL
+		SELECT * FROM #EBPR
+		UNION ALL
+		SELECT * FROM #EIBPR
+		UNION ALL
+		SELECT * FROM #EGBPR
+		UNION ALL
+		SELECT * FROM #EGIBPR
+		UNION ALL
+		SELECT * FROM #EPRBPR
+		UNION ALL
+		SELECT * FROM #E2BPR
+		UNION ALL
+		SELECT * FROM #E2IBPR
+		UNION ALL
+		SELECT * FROM #E140BPR
+		UNION ALL
+		SELECT * FROM #E140IBPR
+
+		Update ger
+		Set ger.NUMER = x.NUMER
+			--,ger.DENOM = x.DENOM
+		From #GetAllResultSets ger
+		Join (Select Patient_Account,COUNT(Distinct Patient_Encounter_Id) NUMER
+		from #Num Group by Patient_Account) x ON ger.Patient_Account = x.Patient_Account
+
+
+end -- numenator
+
+begin --exception denominator
+
+--select distinct popa.patientid 
+--into #ELessDc 
+--from @Population popa
+--left join (select distinct patientid from @DenominatorExclusion union all select distinct patientid from @NumeratorData) de on popa.patientid = de.PatientId 
+--where de.PatientId is null
+
+	select distinct popa.* 
+	into #ELessDc 
+	from #InitialPopulation popa
+	left join (select Patient_Account from #DenominatorExclusions union all select distinct Patient_Account from #Num) de on popa.Patient_Account = de.Patient_Account 
+	where de.Patient_Account is null
+
+	SELECT fp.Patient_Account,(cast(vs.vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,
+	fp.Patient_Encounter_Id,cast(isnull(vs.BP_Diastolic,0) as nvarchar(20)) as Result
+	into #EXCEPTIONDENOMINATOR
+	FROM  [Medcare_DB_Dev].[dbo].[CQM_Vitals_BP] vs
+	inner join #ELessDc el on el.Patient_Account =vs.Patient_Account
+	inner join #PBP pbp on pbp.Patient_Account = vs.Patient_Account
+	inner join #InitialPopulation fp on fp.Patient_Account = vs.Patient_Account
+	where isnull(vs.BP_Diastolic,0) = 0 
+	and  vs.vital_Date  between  pbp.StartDate and pbp.enddate
+	and vs.BP_Refused = 1
+	union all
+	SELECT fp.Patient_Account,(cast(vs.vital_Date as datetime) + cast(vs.Vital_Time as datetime)) Startdate,(cast(vs.vital_Date as datetime) + cast(vs.Vital_Time as datetime)) EndDate,
+	fp.Patient_Encounter_Id,cast(isnull(vs.BP_Systolic,0)as nvarchar(20))  as Result
+	FROM  [Medcare_DB_Dev].[dbo].[CQM_Vitals_BP] vs
+	inner join #ELessDc el on el.Patient_Account =vs.Patient_Account
+	inner join #PBP pbp on pbp.Patient_Account = vs.Patient_Account
+	inner join #InitialPopulation fp on fp.Patient_Account = vs.Patient_Account
+	where isnull(vs.BP_Systolic,0) = 0 
+	and  vs.vital_Date  between  pbp.StartDate and pbp.enddate
+	and vs.BP_Refused = 1
+	union all
+	SELECT fp.Patient_Account,'' Startdate,'' EndDate,
+	fp.Patient_Encounter_Id,null result
+	FROM [Medcare_DB_Dev].[dbo].[CQM_Procedure_Order_List] pl 
+	INNER JOIN(select * from CQM_Test..cqmcodinglist where MeasureNum = '22' and Value_Set_OID = '2.16.840.1.113883.3.526.3.1580' and CMS_ID = 'CMS22v12')
+	icds on icds.Code = pl.Procedure_Code
+	inner join #ELessDc el on el.Patient_Account =pl.Patient_Account
+	inner join #PBP pbp on pbp.Patient_Account = pl.Patient_Account
+	inner join #InitialPopulation fp on fp.Patient_Account = pl.Patient_Account
+	WHERE pl.startdate  >= dateadd(day,-1,pbp.startdate) 
+	and pl.Procedure_Performed = 1
+	union all
+	SELECT fp.Patient_Account,'' Startdate,'' EndDate,
+	fp.Patient_Encounter_Id,isnull(pl.ActionPerformed,'') actionResult
+	FROM #QDM pl 
+	inner join #InitialPopulation fp on fp.Patient_Account = pl.Patient_Account
+	WHERE isnull(pl.ActionPerformed,'')<>''
+	union all
+	SELECT fp.Patient_Account,'' Startdate,'' EndDate,
+	fp.Patient_Encounter_Id,null result
+	FROM [Medcare_DB_Dev].[dbo].[CQM_Medication_Order] pl 
+	INNER JOIN(select * from CQM_Test..cqmcodinglist where MeasureNum = '22' and Value_Set_OID = '2.16.840.1.113883.3.526.3.1580' and CMS_ID = 'CMS22v12')
+	icds on icds.Code = pl.Medication_Code
+	inner join #ELessDc el on el.Patient_Account =pl.Patient_Account
+	inner join #PBP pbp on pbp.Patient_Account = pl.Patient_Account
+	inner join #InitialPopulation fp on fp.Patient_Account = pl.Patient_Account
+	WHERE pl.Effective_Date  >= dateadd(day,-1,pbp.startdate) 
+	--union all
+	--SELECT pl.PatientId,n.CodesDescription Description,
+	-- isnull(pl.LOINC,'')+'|'+isnull(n.CodeSort,'') ICD,pl.LOINCDescription ICDDescription,pl.title,pl.DataType,pl.StartDate StartDate,pl.EndDate EndDate
+	--	  ,isnull(n.ValueSetNum,'') + '|'+isnull(icds.ValueSetNum,'') valueset,pl.NoteId,null result
+	--from [Provider].[CQM_LonicList] pl
+	--inner join(select CodeSort,CodesDescription,ValueSetNum,[Description] from provider.cqmcodelist where  ValueSetNum = '2.16.840.1.113883.3.600.1482' and MeasureNum = 'cqm22' and VersionNum = 'CMS22v5')
+	--icds on icds.CodeSort = pl.Loinc
+	--inner join(select CodeSort,CodesDescription,ValueSetNum,[description] from provider.cqmcodelist where MeasureNum = 'cqm22' and ValueSetNum = '2.16.840.1.113883.3.600.791' and VersionNum = 'CMS22v5')
+	--n on n.CodeSort=pl.Result
+	--inner join #ELessDc el on el.PatientId =pl.PatientId
+	--inner join #PBP pbp on pbp.PatientId = pl.PatientId
+	--inner join #FilterPatients fp on fp.PatientId = pl.PatientId
+	--inner join #FilterProviders fpr on fpr.ProviderId = pl.ProviderId
+	--WHERE pl.startdate  >= dateadd(day,-1,pbp.startdate) --and pl.ActionPerformed is not null
+	----and pl.Providerid = @providerID 
+	----and (pl.Patientid = @PatientId or @PatientId is null)
+	--union all
+	--SELECT pl.PatientId,left(n.CodesDescription,500) Description,
+	--isnull(icds.CodeSort,'')+'|'+isnull(n.CodeSort,'') Icd,left(icds.CodesDescription,500) ICDDescription,'LOINC' title,'Radiology Result' DataType,rord.ObservationDate startdate,rord.ObservationDate enddate,
+	--isnull(n.ValueSetNum,'') + '|'+isnull(icds.ValueSetNum,'') valueset,nror.NotesID,null result
+	--FROM clinical.RadiologyOrderResult pl 
+	--inner join clinical.NotesRadiologyOrderResult nror on pl.RadiologyOrderResultId = nror.RadiologyOrderResultId
+	--inner join clinical.RadiologyOrderResultDetail rord on rord.RadiologyOrderResultId = pl.RadiologyOrderResultId
+	--inner join clinical.RadiologyOrder ro on ro.RadiologyOrderId = pl.RadiologyOrderId
+	--inner join (select CodeSort,CodesDescription,ValueSetNum,[description] from provider.cqmcodelist where  ValueSetNum = '2.16.840.1.113883.3.600.2448' and MeasureNum = 'cqm22' and VersionNum = 'CMS22v5') 
+	--icds on icds.CodeSort = rord.LOINC
+	--inner join(select CodeSort,CodesDescription,ValueSetNum,[description] from provider.cqmcodelist where MeasureNum = 'cqm22' and ValueSetNum = '2.16.840.1.113883.3.600.791' and VersionNum = 'CMS22v5')
+	--n on n.CodeSort=ro.ActionPerformed -- rord.result
+	--inner join #ELessDc el on el.PatientId =pl.PatientId
+	--inner join #PBP pbp on pbp.PatientId = pl.PatientId
+	--inner join #FilterPatients fp on fp.PatientId = pl.PatientId
+	--inner join #FilterProviders fpr on fpr.ProviderId = pl.ProviderId
+	--WHERE rord.ObservationDate   >= dateadd(day,-1,pbp.startdate) 
+	--union all
+	--SELECT pl.PatientId,left(n.CodesDescription,500) Description,
+	--isnull(icds.CodeSort,'')+'|'+isnull(n.CodeSort,'') Icd,left(icds.CodesDescription,500) ICDDescription,'LOINC' title,'Radiology Result' DataType,rot.TestDate startdate,rot.TestDate enddate,
+	--isnull(n.ValueSetNum,'') + '|'+isnull(icds.ValueSetNum,'') valueset,nror.NotesID,null result
+	--FROM clinical.RadiologyOrder pl 
+	--inner join clinical.NotesRadiologyOrder nror on pl.RadiologyOrderId = nror.RadiologyOrderId
+	--inner join clinical.RadiologyOrderTest rot on rot.RadiologyOrderId = pl.RadiologyOrderId
+	--inner join (select CodeSort,CodesDescription,ValueSetNum,[description] from provider.cqmcodelist where  ValueSetNum = '2.16.840.1.113883.3.600.2448' and MeasureNum = 'cqm22' and VersionNum = 'CMS22v5') 
+	--icds on icds.CodeSort = rot.CPTCode
+	--inner join(select CodeSort,CodesDescription,ValueSetNum,[description] from provider.cqmcodelist where MeasureNum = 'cqm22' and ValueSetNum = '2.16.840.1.113883.3.600.791' and VersionNum = 'CMS22v5')
+	--n on n.CodeSort=pl.ActionPerformed -- rord.result
+	--inner join #ELessDc el on el.PatientId =pl.PatientId
+	--inner join #PBP pbp on pbp.PatientId = pl.PatientId
+	--inner join #FilterPatients fp on fp.PatientId = pl.PatientId
+	--inner join #FilterProviders fpr on fpr.ProviderId = pl.ProviderId
+	--WHERE rot.TestDate   >= dateadd(day,-1,pbp.startdate) 
+	----and pl.Providerid = @providerID 
+	----and (pl.Patientid = @PatientId or @PatientId is null)
+
+	--Select * from #Num
+	--Select * from #DenominatorExceptions
+			Update ger
+		Set ger.DENEXCEP = x.DENEXCEP
+		From #GetAllResultSets ger
+		Join (Select Patient_Account,COUNT(Distinct Patient_Encounter_Id) DENEXCEP
+		from #DenominatorExceptions Group by Patient_Account) x ON ger.Patient_Account = x.Patient_Account
+
+
+	
+end --denominator exception
+
+	
+
+
+	----------------------FINAL RESULT SET SECTION START
+	
+	BEGIN
+		SELECT CAST(Patient_Account AS VARCHAR) Patient_Account, Patient_Name, Gender, DOB, SUM(IPOP) IPOP, SUM(DENOM) DENOM
+			, SUM(NUMER) NUMER, SUM(DENEXCL) DENEXCL, SUM(DENEXCEP) DENEXCEP
+		INTO #getResult 
+		FROM #GetAllResultSets 
+		GROUP BY ROLLUP(CAST(Patient_Account AS VARCHAR), Patient_Name, Gender, DOB)
+
+		-- This IS when we GROUP BY ROLLUP we get extra NULL columns AND grouping of columns so used the machanissm to overcome result
+		SELECT * 
+		INTO #fnlResult 
+		FROM #getResult
+		WHERE Patient_Account IS NOT NULL AND Patient_Name IS NOT NULL AND Gender IS NOT NULL AND DOB IS NOT NULL
+		UNION
+		SELECT * FROM #getResult WHERE Patient_Account IS NULL AND Patient_Name IS NULL 
+
+		SELECT @TotalPats = COUNT(Patient_Account) FROM #fnlResult
+	
+		IF EXISTS (SELECT 1 FROM #fnlResult WHERE Patient_Account IS NULL AND Patient_Name IS NULL)
+		BEGIN
+			UPDATE #fnlResult
+			SET Patient_Account = 'Total'
+			WHERE Patient_Account IS NULL AND Patient_Name IS NULL
+		END
+	END
+
+	----------------------FINAL RESULT SET SECTION END
+	
+
+	----------------------RETURN RESULT SET ACCORDING @Report1 PARAM VALUE SECTION START
+	
+	IF @Report1 = 1
+		BEGIN	--RETURNS DATA ON THE BASIS OF POPULATION CRITERIA
+			IF @PopulationCriteria = 'Initial Population'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, IPOP, 0 DENOM, 0 NUMER, 0 DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Denominator'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, DENOM, 0 NUMER, 0 DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE DENOM > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Numerator'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, NUMER, 0 DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE NUMER > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Exclusion'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, 0 NUMER, DENEXCL, 0 DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE DENEXCL > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Exception'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, 0 NUMER, 0 DENEXCL, DENEXCEP, 0 NOT_MET
+					FROM #fnlResult
+					WHERE DENEXCEP > 0 AND IPOP <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE IF @PopulationCriteria = 'Not Met'
+				BEGIN
+					SELECT Patient_Account, Patient_Name, Gender, DOB, 0 IPOP, 0 DENOM, 0 NUMER, 0 DENEXCL, 0 DENEXCEP, (IPOP - NUMER - DENEXCL - DENEXCEP) NOT_MET
+					FROM #fnlResult
+					WHERE (IPOP - NUMER - DENEXCL - DENEXCEP) <> 0
+					ORDER BY Patient_Name
+				END
+			ELSE
+				BEGIN
+					SELECT fr.*, [NOT_MET] = (IPOP - NUMER - DENEXCL - DENEXCEP) -- A - B - 0 - 0 = X,A - 0 - 0 - 0 = A 
+					FROM #fnlResult fr
+					ORDER BY Patient_Name
+				END
+		END
+	ELSE	
+		BEGIN	--COUNTS FOR TABS ON POPUP OR DASHBOARD
+			SELECT 'CMS22v12' AS MeasureId, @TotalPats AS AllPatientsCount, IPOP InitialPopulationCount
+				, DENOM AS DenominatorCount, NUMER AS NumeratorCount, DENEXCL AS ExclusionCount, DENEXCEP AS ExceptionCount
+				, NotMetCount = (IPOP - NUMER - DENEXCL - DENEXCEP), TotalEncountersCount = IPOP, EncountersCount = NUMER
+			FROM #fnlResult
+			WHERE Patient_Account = 'Total'
+		END
+
+	----------------------RETURN RESULT SET ACCORDING @Report1 PARAM VALUE SECTION END
+	
+
+	----------------------DROP ALL TEMP TABLES SECTION START
+	
+	BEGIN
+		IF (OBJECT_ID('tempdb..#GetAllResultSets') IS NOT NULL)
+			DROP TABLE #GetAllResultSets			
+
+		IF (OBJECT_ID('tempdb..#ValuesetBasedEncounters') IS NOT NULL)
+			DROP TABLE #ValuesetBasedEncounters
+
+		IF (OBJECT_ID('tempdb..#InitialPopulation') IS NOT NULL) 
+			DROP TABLE #InitialPopulation
+
+		IF (OBJECT_ID('tempdb..#DenominatorExclusions') IS NOT NULL) 
+			DROP TABLE #DenominatorExclusions
+	
+		IF (OBJECT_ID('tempdb..#Numerator') IS NOT NULL) 
+			DROP TABLE #Numerator		
+
+		IF (OBJECT_ID('tempdb..#DenominatorExceptions') IS NOT NULL)
+			DROP TABLE #DenominatorExceptions
+
+		IF (OBJECT_ID('tempdb..#valuseSetCoding') IS NOT NULL)
+			DROP TABLE #valuseSetCoding
+
+		IF (OBJECT_ID('tempdb..#initialPats') IS NOT NULL)
+			DROP TABLE #initialPats
+
+		IF (OBJECT_ID('tempdb..#getResult') IS NOT NULL)
+			DROP TABLE #getResult
+
+		IF (OBJECT_ID('tempdb..#fnlResult') IS NOT NULL)
+			DROP TABLE #fnlResult
+	END
+
+	----------------------DROP ALL TEMP TABLES SECTION END
+END
